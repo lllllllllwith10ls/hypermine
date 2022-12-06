@@ -8,6 +8,7 @@ use crate::{
     terraingen::VoronoiInfo,
     world::Material,
     Plane,
+    math,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -49,10 +50,12 @@ impl NodeStateRoad {
     const ROOT: Self = West;
 
     /// What state comes after this state, from a given side?
-    fn child(self, side: Side) -> Self {
+    fn child(self, side: Side, kind: NodeStateKind) -> Self {
         match (self, side) {
             (East, Side::B) => West,
             (West, Side::B) => East,
+            (East, _) if !side.adjacent_to(Side::B) && (kind == NodeStateKind::Sky || kind == NodeStateKind::Land) => East,
+            (West, _) if !side.adjacent_to(Side::B) && (kind == NodeStateKind::Sky || kind == NodeStateKind::Land) => West,
             (East, _) if !side.adjacent_to(Side::B) => DeepEast,
             (West, _) if !side.adjacent_to(Side::B) => DeepWest,
             _ => self,
@@ -60,8 +63,33 @@ impl NodeStateRoad {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum NodeStateHoro {
+    Horosphere(na::Vector4<f64>, f64)
+}
+impl NodeStateHoro {
+    const ROOT: Self = Horosphere(na::Vector4::new(0.0, 1.0, 0.0, 1.0), 1.0);
+
+    /// What state comes after this state, from a given side?
+    pub fn child_with_spice(self, side: Side) -> Self {
+        let Horosphere(v, factor) = self;
+        let mut w: na::Vector4<f64> = side.reflection() * v;
+        w[3] = (w[0]*w[0] + w[1]*w[1] + w[2]*w[2]).sqrt(); // Make sure center stays ideal point
+        let norm = w.norm();
+        Horosphere(w / norm, factor * norm)
+    }
+
+    pub fn solid_material(self) -> Option<Material> {
+        match self {
+            _ => None,
+        }
+    }
+}
+use NodeStateHoro::*;
+
 pub struct NodeState {
     kind: NodeStateKind,
+    horo: NodeStateHoro,
     surface: Plane<f64>,
     road_state: NodeStateRoad,
     spice: u64,
@@ -71,6 +99,7 @@ impl NodeState {
     pub fn root() -> Self {
         Self {
             kind: NodeStateKind::ROOT,
+            horo: NodeStateHoro::ROOT,
             surface: Plane::from(Side::A),
             road_state: NodeStateRoad::ROOT,
             spice: 0,
@@ -114,7 +143,8 @@ impl NodeState {
         };
 
         let child_kind = self.kind.child(side);
-        let child_road = self.road_state.child(side);
+        let child_road = self.road_state.child(side, child_kind);
+        let child_horo = self.horo.child_with_spice(side);
 
         Self {
             kind: child_kind,
@@ -126,6 +156,7 @@ impl NodeState {
             road_state: child_road,
             spice,
             enviro,
+            horo: child_horo,
         }
     }
 
@@ -185,6 +216,8 @@ pub struct ChunkParams {
     is_road_support: bool,
     /// Random quantity used to seed terrain gen
     node_spice: u64,
+    /// Whether this is a horosphere
+    horo: NodeStateHoro,
 }
 
 impl ChunkParams {
@@ -203,6 +236,7 @@ impl ChunkParams {
             is_road_support: ((state.kind == Land) || (state.kind == DeepLand))
                 && ((state.road_state == East) || (state.road_state == West)),
             node_spice: state.spice,
+            horo: state.horo,
         })
     }
 
@@ -255,6 +289,8 @@ impl ChunkParams {
         if self.dimension > 4 && matches!(voxels, VoxelData::Dense(_)) {
             self.generate_trees(&mut voxels, &mut rng);
         }
+        
+        self.generate_horosphere(&mut voxels);
 
         voxels
     }
@@ -421,12 +457,42 @@ impl ChunkParams {
                         || (i.material == Material::CoarseGrass)
                     {
                         voxels.data_mut(self.dimension)[voxel_of_interest_index] = Material::Wood;
-                        let leaf_location = index(self.dimension, i.coords_opposing);
-                        voxels.data_mut(self.dimension)[leaf_location] = Material::Leaves;
+                        let trunk_location = index(self.dimension, i.coords_opposing);
+                        voxels.data_mut(self.dimension)[trunk_location] = Material::Wood;
+                        let neighbor_data2 = self.voxel_neighbors(i.coords_opposing, voxels);
+                        for j in neighbor_data2.iter() {
+                            if j.material == Material::Void
+                            {
+                                let leaf_location = index(self.dimension, j.coords);
+                                voxels.data_mut(self.dimension)[leaf_location] = Material::Leaves;
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    fn generate_horosphere(&self, voxels: &mut VoxelData) {
+        let Horosphere(center, factor) = self.horo;
+        for (x, y, z) in VoxelCoords::new(self.dimension) {
+            let coords = na::Vector3::new(x, y, z);
+            let distance = Self::horosphere_distance(&center, factor, (x as f64 + 0.5) / self.dimension as f64, (y as f64 + 0.5) / self.dimension as f64, (z as f64 + 0.5) / self.dimension as f64, self.chunk);
+            let mat = if distance > -0.1 {
+                Material::Sun
+            } else {
+                Material::Void
+            };
+
+            if mat != Material::Void {
+                voxels.data_mut(self.dimension)[index(self.dimension, coords)] = mat;
+            }
+        }
+    }
+    fn horosphere_distance(center: &na::Vector4<f64>, factor: f64, cx: f64, cy: f64, cz: f64, cube_type: Vertex) -> f64 {
+        let pos: na::Vector4<f64> = math::lorentz_normalize(&(cube_type.chunk_to_node() * na::Vector4::new(cx, cy, cz, 1.0)));
+        let mip_value = math::mip(&pos, center) * factor;
+        mip_value.abs().asinh() * mip_value.signum()
     }
 
     /// Provides information on the type of material in a voxel's six neighbours
@@ -464,6 +530,7 @@ impl ChunkParams {
         NeighborData {
             coords_opposing,
             material,
+            coords,
         }
     }
 }
@@ -473,6 +540,7 @@ const TERRAIN_SMOOTHNESS: f64 = 10.0;
 struct NeighborData {
     coords_opposing: na::Vector3<u8>,
     material: Material,
+    coords: na::Vector3<u8>,
 }
 
 #[derive(Copy, Clone)]

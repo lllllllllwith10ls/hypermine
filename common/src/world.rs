@@ -41,10 +41,11 @@ pub enum Material {
     MudGrass = 37,
     Grass = 38,
     CaveGrass = 39,
+    Sun = 40,
 }
 
 impl Material {
-    pub const COUNT: usize = 40;
+    pub const COUNT: usize = 41;
 }
 
 impl Default for Material {
