@@ -27,8 +27,8 @@ impl NodeStateKind {
         match (self, side) {
             (Sky, Side::A) => Land,
             (Land, Side::A) => Sky,
-            (Sky, _) if !side.adjacent_to(Side::A) => DeepSky,
-            (Land, _) if !side.adjacent_to(Side::A) => DeepLand,
+            (Sky, _) if !side.adjacent_to(Side::A) => Sky,
+            (Land, _) if !side.adjacent_to(Side::A) => Land,
             _ => self,
         }
     }

@@ -66,6 +66,7 @@ pub struct Sim {
     jump_speed: f64,
     max_cos_slope: f64,
     radius: f64,
+    alignment_speed: f64,
 }
 
 impl Sim {
@@ -105,6 +106,7 @@ impl Sim {
             jump_speed: 0.4,
             max_cos_slope: 0.5,
             radius: 0.02,
+            alignment_speed: 0.025,
         }
     }
 
@@ -751,7 +753,21 @@ impl PlayerPhysicsPass<'_> {
     }
 
     fn align_with_gravity(&mut self) {
-        let transformation = math::translate2(&na::Vector4::y(), &self.get_relative_up());
+        let relative_up = self.get_relative_up();
+        let target_up = na::Vector3::from_homogeneous(relative_up).unwrap();
+        
+        let angle = na::Rotation3::rotation_between(&na::Vector3::y(), &target_up).unwrap().angle();
+        let output_up;
+        if angle < self.sim.alignment_speed && angle > -self.sim.alignment_speed
+        {
+            output_up = relative_up;
+        }
+        else 
+        {
+            let rotation = na::Rotation3::from_axis_angle(&na::Unit::new_normalize(na::Vector3::y().cross(&target_up)), self.sim.alignment_speed);
+            output_up = (rotation * na::Vector3::y()).to_homogeneous();
+        }
+        let transformation = math::translate2(&na::Vector4::y(), &output_up);
         self.sim.position_local *= transformation;
         let transformation_inverse = transformation.try_inverse().unwrap();
         self.sim.vel = transformation_inverse * self.sim.vel;
