@@ -8,6 +8,7 @@ use crate::{
     terraingen::VoronoiInfo,
     world::Material,
     Plane,
+    Line,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -27,8 +28,8 @@ impl NodeStateKind {
         match (self, side) {
             (Sky, Side::A) => Land,
             (Land, Side::A) => Sky,
-            (Sky, _) if !side.adjacent_to(Side::A) => Sky,
-            (Land, _) if !side.adjacent_to(Side::A) => Land,
+            (Sky, _) if !side.adjacent_to(Side::A) => DeepSky,
+            (Land, _) if !side.adjacent_to(Side::A) => DeepLand,
             _ => self,
         }
     }
@@ -60,10 +61,42 @@ impl NodeStateRoad {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NodeTypeTree {
+    Air,
+    Trunk,
+    Trunk2,
+    Trunk3,
+    Branch,
+}
+
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct NodeStateTree {
+    node_type: NodeTypeTree,
+    side_from: Side
+}
+use NodeTypeTree::*;
+impl NodeStateTree {
+    const ROOT: Self = NodeStateTree{node_type: Trunk, side_from: Side::J};
+
+    /// What state comes after this state, from a given side?
+    fn child(self, side: Side) -> Self {
+        match self.node_type {
+            Trunk if side.opposite_of(self.side_from) => NodeStateTree{node_type: Branch, side_from: side},
+            Trunk2 if side.opposite_of(self.side_from) => NodeStateTree{node_type: Branch, side_from: side},
+            Trunk3 if side.opposite_of(self.side_from) => NodeStateTree{node_type: Branch, side_from: side},
+            Branch if !side.adjacent_to(self.side_from) => NodeStateTree{node_type: Branch, side_from: side},
+            _ => NodeStateTree{node_type: Air, side_from: side},
+        }
+    }
+}
+
 pub struct NodeState {
     kind: NodeStateKind,
     surface: Plane<f64>,
     road_state: NodeStateRoad,
+    tree: NodeStateTree,
     spice: u64,
     enviro: EnviroFactors,
 }
@@ -73,6 +106,7 @@ impl NodeState {
             kind: NodeStateKind::ROOT,
             surface: Plane::from(Side::A),
             road_state: NodeStateRoad::ROOT,
+            tree: NodeStateTree::ROOT,
             spice: 0,
             enviro: EnviroFactors {
                 max_elevation: 0.0,
@@ -115,6 +149,7 @@ impl NodeState {
 
         let child_kind = self.kind.child(side);
         let child_road = self.road_state.child(side);
+        let child_tree = self.tree.child(side);
 
         Self {
             kind: child_kind,
@@ -124,6 +159,7 @@ impl NodeState {
                 _ => side * self.surface,
             },
             road_state: child_road,
+            tree: child_tree,
             spice,
             enviro,
         }
@@ -183,6 +219,12 @@ pub struct ChunkParams {
     is_road: bool,
     /// Whether this chunk contains a section of the road's supports
     is_road_support: bool,
+    /// Whether this chunk contains the tree
+    is_tree: bool,
+    /// Whether this tree is a branch
+    is_branch: bool,
+    /// What side the tree is from
+    side_from: Side,
     /// Random quantity used to seed terrain gen
     node_spice: u64,
 }
@@ -202,6 +244,10 @@ impl ChunkParams {
                 && ((state.road_state == East) || (state.road_state == West)),
             is_road_support: ((state.kind == Land) || (state.kind == DeepLand))
                 && ((state.road_state == East) || (state.road_state == West)),
+            is_tree: (state.tree.node_type == Trunk) || (state.tree.node_type == Trunk2) || (state.tree.node_type == Trunk3) || (state.tree.node_type == Branch),
+            is_branch: (state.kind == Sky || state.kind == DeepSky)
+                && (state.tree.node_type == Branch),
+            side_from: state.tree.side_from,
             node_spice: state.spice,
         })
     }
@@ -227,7 +273,7 @@ impl ChunkParams {
             .surface
             .distance_to_chunk(self.chunk, &na::Vector3::repeat(0.5));
         if (center_elevation - ELEVATION_MARGIN > me_max / TERRAIN_SMOOTHNESS)
-            && !(self.is_road || self.is_road_support)
+            && !(self.is_road || self.is_road_support || self.is_tree)
         {
             // The whole chunk is above ground and not part of the road
             return VoxelData::Solid(Material::Void);
@@ -250,10 +296,15 @@ impl ChunkParams {
             self.generate_road_support(&mut voxels);
         }
 
+
+        if self.is_tree {
+            self.generate_tree(&mut voxels, self.side_from, self.is_branch);
+        }
+
         // TODO: Don't generate detailed data for solid chunks with no neighboring voids
 
-        if self.dimension > 4 && matches!(voxels, VoxelData::Dense(_)) {
-            self.generate_trees(&mut voxels, &mut rng);
+        if self.dimension > 4 && (matches!(voxels, VoxelData::Dense(_)) || self.is_tree) {
+            self.generate_trees(&mut voxels, &mut rng, self.is_tree);
         }
 
         voxels
@@ -339,6 +390,37 @@ impl ChunkParams {
                 }
             }
 
+            if mat != Material::Void {
+                voxels.data_mut(self.dimension)[index(self.dimension, coords)] = mat;
+            }
+        }
+    }
+
+
+    /// Places a tree.
+    fn generate_tree(&self, voxels: &mut VoxelData, side: Side, branch: bool) {
+        let line = Line::from(side);
+        for (x, y, z) in VoxelCoords::new(self.dimension) {
+            let coords = na::Vector3::new(x, y, z);
+            let center = voxel_center(self.dimension, coords);
+            let mut horizontal_distance = line.distance_to_chunk(self.chunk, &center);
+            if branch {
+                for side2 in Side::iter() {
+                    if !side.adjacent_to(side2) {
+                        let plane2 = -Plane::from(side2);
+                        if plane2.distance_to_chunk(self.chunk, &center) < 1.0 {
+                            let line2 = Line::from(side2);
+                            horizontal_distance = f64::min(horizontal_distance,line2.distance_to_chunk(self.chunk, &center));
+                        }
+                    }
+                }
+            }
+            if horizontal_distance > 0.2 {
+                continue;
+            }
+
+            let mat = Material::Wood;
+            
             voxels.data_mut(self.dimension)[index(self.dimension, coords)] = mat;
         }
     }
@@ -393,13 +475,16 @@ impl ChunkParams {
     /// Plants trees on dirt and grass. Trees consist of a block of wood
     /// and a block of leaves. The leaf block is on the opposite face of the
     /// wood block as the ground block.
-    fn generate_trees(&self, voxels: &mut VoxelData, rng: &mut Pcg64Mcg) {
+    fn generate_trees(&self, voxels: &mut VoxelData, rng: &mut Pcg64Mcg, tree_override: bool) {
         // margins are added to keep voxels outside the chunk from being read/written
         let random_position = Uniform::new(1, self.dimension - 1);
 
         let rain = self.env.rainfalls[0];
-        let tree_candidate_count = (u32::from(self.dimension - 2).pow(3) as f64
+        let mut tree_candidate_count = (u32::from(self.dimension - 2).pow(3) as f64
             * (rain / 100.0).max(0.0).min(0.5)) as usize;
+        if tree_override {
+            tree_candidate_count = ((u32::from(self.dimension - 2).pow(3) as f64) / 5.0) as usize;
+        }
         for _ in 0..tree_candidate_count {
             let loc = na::Vector3::from_distribution(&random_position, rng);
             let voxel_of_interest_index = index(self.dimension, loc);
@@ -413,12 +498,13 @@ impl ChunkParams {
             // Only plant a tree if there is exactly one adjacent block of dirt or grass
             if num_void_neighbors == 5 {
                 for i in neighbor_data.iter() {
-                    if (i.material == Material::Dirt)
+                    if (!tree_override && ((i.material == Material::Dirt)
                         || (i.material == Material::Grass)
                         || (i.material == Material::MudGrass)
                         || (i.material == Material::LushGrass)
                         || (i.material == Material::TanGrass)
-                        || (i.material == Material::CoarseGrass)
+                        || (i.material == Material::CoarseGrass))) || 
+                        (tree_override && (i.material == Material::Wood))
                     {
                         voxels.data_mut(self.dimension)[voxel_of_interest_index] = Material::Wood;
                         let leaf_location = index(self.dimension, i.coords_opposing);

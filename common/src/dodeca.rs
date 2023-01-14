@@ -43,6 +43,12 @@ impl Side {
         ADJACENT[self as usize][other as usize]
     }
 
+    /// Whether `self` and `other` are on opposite sides
+    #[inline]
+    pub fn opposite_of(self, other: Side) -> bool {
+        OPPOSITE[self as usize][other as usize]
+    }
+
     /// Outward normal vector of this side
     #[inline]
     pub fn normal(self) -> &'static na::Vector4<f64> {
@@ -188,6 +194,20 @@ lazy_static! {
                 // Possile cosh_distances: 1, 4.23606 = 2+sqrt(5), 9.47213 = 5+2*sqrt(5), 12.70820 = 6+3*sqrt(5);
                 // < 2.0 indicates identical faces; < 5.0 indicates adjacent faces; > 5.0 indicates non-adjacent faces
                 result[i][j] = (2.0..5.0).contains(&cosh_distance);
+            }
+        }
+        result
+    };
+
+    /// Whether two sides are opposite
+    static ref OPPOSITE: [[bool; SIDE_COUNT]; SIDE_COUNT] = {
+        let mut result = [[false; SIDE_COUNT]; SIDE_COUNT];
+        for i in 0..SIDE_COUNT {
+            for j in 0..SIDE_COUNT {
+                let cosh_distance = (REFLECTIONS[i] * REFLECTIONS[j])[(3, 3)];
+                // Possile cosh_distances: 1, 4.23606 = 2+sqrt(5), 9.47213 = 5+2*sqrt(5), 12.70820 = 6+3*sqrt(5);
+                // < 2.0 indicates identical faces; < 5.0 indicates adjacent faces; > 5.0 indicates non-adjacent faces
+                result[i][j] = &cosh_distance > &12.0;
             }
         }
         result
