@@ -17,8 +17,9 @@ use common::{
     dodeca::Vertex,
     graph::{Graph, NodeId},
     math,
-    node::{Chunk, DualGraph, Node},
+    node::{Chunk, DualGraph, Node, VoxelData},
     proto::{self, Character, Command, Component, Position},
+    sanitize_motion_input,
     world::Material,
     worldgen::NodeState,
     Chunks, EntityId, GraphEntities, Step,
@@ -39,6 +40,7 @@ pub struct Sim {
     position_node: NodeId,
     yaw: f32,
     pitch: f32,
+    noclip: bool,
     step: Option<Step>,
 
     // Input state
@@ -81,6 +83,7 @@ impl Sim {
             position_node: NodeId::ROOT,
             yaw: 0.0,
             pitch: 0.0,
+            noclip: false,
             step: None,
 
             since_input_sent: Duration::new(0, 0),
@@ -136,6 +139,10 @@ impl Sim {
         self.jumping = true;
     }
 
+    pub fn set_noclip(&mut self, noclip: bool) {
+        self.noclip = noclip;
+    }
+
     pub fn break_block(&mut self) {
         self.breaking_block = true;
         self.break_block_timer = Some(0.2);
@@ -184,7 +191,19 @@ impl Sim {
                 }
             }
 
-            PlayerPhysicsPass { sim: self, dt }.step();
+            if self.noclip {
+                self.vel = na::Vector4::zeros();
+                let movement_speed = self.params.as_ref().unwrap().movement_speed;
+                let (direction, speed) = sanitize_motion_input(
+                    self.get_orientation() * self.instantaneous_velocity * movement_speed,
+                );
+                self.position_local *=
+                    math::translate_along(&direction.cast(), speed as f64 * dt.as_secs_f64());
+                PlayerPhysicsPass { sim: self, dt }.align_with_gravity();
+                PlayerPhysicsPass { sim: self, dt }.renormalize_transform();
+            } else {
+                PlayerPhysicsPass { sim: self, dt }.step();
+            }
             self.jumping = false;
 
             if let Some(ref mut break_block_timer) = self.break_block_timer {
@@ -262,7 +281,10 @@ impl Sim {
                 return;
             };
 
-            let conflict = placing && self.placing_has_conflict(block_pos.0, block_pos.1, block_pos.2);
+            let conflict =
+                placing && self.placing_has_conflict(block_pos.0, block_pos.1, block_pos.2);
+
+            let mut must_fix_neighboring_chunks = false;
 
             if let Some(node) = self.graph.get_mut(block_pos.0) {
                 if let Chunk::Populated {
@@ -279,13 +301,56 @@ impl Sim {
                     if placing {
                         if data[array_entry] == Material::Void && !conflict {
                             data[array_entry] = Material::WoodPlanks;
+                            must_fix_neighboring_chunks = true;
                         }
                     } else {
                         data[array_entry] = Material::Void;
+                        must_fix_neighboring_chunks = true;
                     }
 
                     *old_surface = *surface;
                     *surface = None;
+                }
+            }
+
+            if must_fix_neighboring_chunks {
+                self.turn_neighboring_solid_to_dense(block_pos.0, block_pos.1, block_pos.2, 0, 1);
+                self.turn_neighboring_solid_to_dense(block_pos.0, block_pos.1, block_pos.2, 0, -1);
+                self.turn_neighboring_solid_to_dense(block_pos.0, block_pos.1, block_pos.2, 1, 1);
+                self.turn_neighboring_solid_to_dense(block_pos.0, block_pos.1, block_pos.2, 1, -1);
+                self.turn_neighboring_solid_to_dense(block_pos.0, block_pos.1, block_pos.2, 2, 1);
+                self.turn_neighboring_solid_to_dense(block_pos.0, block_pos.1, block_pos.2, 2, -1);
+            }
+        }
+    }
+
+    fn turn_neighboring_solid_to_dense(
+        &mut self,
+        node: NodeId,
+        vertex: Vertex,
+        coords: [usize; 3],
+        coord_axis: usize,
+        coord_direction: isize,
+    ) {
+        let dimension = self.params.as_ref().unwrap().chunk_size;
+
+        if let Some((neighbor_node, neighbor_vertex, _neighbor_coords)) =
+            self.get_block_neighbor(node, vertex, coords, coord_axis, coord_direction)
+        {
+            if let Some(neighbor_node_data) = self.graph.get_mut(neighbor_node) {
+                if let Chunk::Populated {
+                    voxels,
+                    surface,
+                    old_surface,
+                } = &mut neighbor_node_data.chunks[neighbor_vertex]
+                {
+                    if matches!(voxels, VoxelData::Solid(..)) {
+                        // This function has the side effect of turning solid chunks into dense chunks,
+                        // which is what we want for them to render properly.
+                        voxels.data_mut(dimension);
+                        *old_surface = *surface;
+                        *surface = None;
+                    }
                 }
             }
         }
@@ -634,32 +699,55 @@ impl PlayerPhysicsPass<'_> {
             self.sim.position_local *= ray_tracing_transform;
 
             if let Some(intersection) = ray_tracing_result.intersection {
-                active_normals.retain(|n| n.dot(&intersection.normal) < 0.0);
-                if active_normals.len() == 2 {
-                    // The player is completely stuck in a corner and cannot move further
-                    self.sim.vel = na::Vector4::zeros();
-                    break;
-                }
-                let effective_normal = if active_normals.is_empty() {
-                    intersection.normal
-                } else {
-                    // Ensure wall sliding doesn't push player back to already-collided wall
-                    math::project_ortho(&intersection.normal, &active_normals[0]).normalize()
-                };
-
                 if math::mip(&intersection.normal, &self.get_relative_up()) > self.sim.max_cos_slope
                 {
                     self.update_ground_normal(&intersection.normal);
+
+                    // The update of the ground normal is not a simple projection, so some normals
+                    // will need to be deactivated to avoid the player getting stuck in certain edge
+                    // cases. For this, we only retain normals the player is moving towards.
+                    active_normals.retain(|n| n.dot(&self.sim.vel) < 0.0);
+                } else {
+                    active_normals.retain(|n| n.dot(&intersection.normal) < 0.0);
+                    active_normals.push(intersection.normal);
                 }
 
-                self.sim.vel = math::project_ortho(&self.sim.vel, &effective_normal);
-                remaining_dt -= ray_tracing_result.t.atanh() / initial_velocity_norm;
+                self.sim.vel = self.apply_normals(
+                    active_normals
+                        .clone()
+                        .into_iter()
+                        .chain(self.sim.ground_normal)
+                        .collect(),
+                    self.sim.vel,
+                );
 
-                active_normals.push(intersection.normal);
+                remaining_dt -= ray_tracing_result.t.atanh() / initial_velocity_norm;
             } else {
                 break;
             }
         }
+    }
+
+    fn apply_normals(
+        &self,
+        mut normals: Vec<na::Vector4<f64>>,
+        mut subject: na::Vector4<f64>,
+    ) -> na::Vector4<f64> {
+        // In this method, the w-coordinate is assumed to be 0 for all vectors passed in.
+
+        if normals.len() >= 3 {
+            // The normals are assumed to be linearly independent with w coordinate 0,
+            // so applying all of them will zero out the subject.
+            return na::Vector4::zeros();
+        }
+
+        for i in 0..normals.len() {
+            for j in i + 1..normals.len() {
+                normals[j] = math::project_ortho(&normals[j], &normals[i]).normalize();
+            }
+            subject = math::project_ortho(&subject, &normals[i]);
+        }
+        subject
     }
 
     fn align_with_gravity(&mut self) {
@@ -672,10 +760,10 @@ impl PlayerPhysicsPass<'_> {
 
     fn clamp_to_ground_or_start_falling(&mut self) {
         let mut clamp_vector = -na::Vector4::y() * 0.01;
+        let mut active_normals = Vec::<na::Vector4<f64>>::with_capacity(2);
         for _ in 0..Self::MAX_COLLISION_ITERATIONS {
             let (ray_tracing_result, ray_tracing_transform) = self.trace_ray(&clamp_vector);
 
-            // TODO: Will need to allow two collision normals to act at once, especially in 3D
             if let Some(intersection) = ray_tracing_result.intersection {
                 let potential_transform = self.sim.position_local * ray_tracing_transform;
                 if math::mip(&intersection.normal, &self.get_relative_up()) > self.sim.max_cos_slope
@@ -684,13 +772,16 @@ impl PlayerPhysicsPass<'_> {
                     self.update_ground_normal(&intersection.normal);
                     return;
                 } else {
+                    active_normals.retain(|n| n.dot(&intersection.normal) < 0.0);
+                    active_normals.push(intersection.normal);
+
                     // Shrink clamp vector based on travel distance. This is an approximation based on clamp_vector being small.
                     // More accurate shrinkage can be found at apply_velocity_iteration.
                     clamp_vector -= ray_tracing_transform.column(3);
                     clamp_vector.w = 0.0;
+
                     // Adjust clamp vector to be perpendicular to the normal vector.
-                    clamp_vector = math::project_ortho(&clamp_vector, &intersection.normal);
-                    self.sim.ground_normal = None;
+                    clamp_vector = self.apply_normals(active_normals.clone(), clamp_vector);
                 }
             } else {
                 break;
