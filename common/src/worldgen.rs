@@ -65,23 +65,72 @@ impl NodeStateRoad {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum NodeStateHoro {
-    Horosphere(na::Vector4<f64>, f64)
+    Horosphere(na::Vector4<f64>, f64, bool)
 }
 impl NodeStateHoro {
-    const ROOT: Self = Horosphere(na::Vector4::new(0.0, 1.0, 0.0, 1.0), 1.0);
 
     /// What state comes after this state, from a given side?
     pub fn child_with_spice(self, side: Side) -> Self {
-        let Horosphere(v, factor) = self;
+        let Horosphere(v, factor, parity) = self;
         let mut w: na::Vector4<f64> = side.reflection() * v;
         w[3] = (w[0]*w[0] + w[1]*w[1] + w[2]*w[2]).sqrt(); // Make sure center stays ideal point
         let norm = w.norm();
-        Horosphere(w / norm, factor * norm)
+        Horosphere(w / norm, factor * norm, parity)
+    }
+    
+    /// Generate new horosphere
+    pub fn new_child_with_spice(self, side: Side, spice: u64) -> Self {
+        let mut rng = rand_pcg::Pcg64Mcg::seed_from_u64(spice);
+        let unif = Uniform::new_inclusive(-0.1, 0.1);
+        let Horosphere(_, _, parity) = self;
+        let mut w: na::Vector4<f64> = -*side.normal();
+        w[0] += rng.sample(unif);
+        w[1] += rng.sample(unif);
+        w[2] += rng.sample(unif);
+        w[3] = (w[0]*w[0] + w[1]*w[1] + w[2]*w[2]).sqrt(); // Make sure center stays ideal point
+        let norm = w[3];
+        let unif2 = Uniform::new_inclusive(0.1, 0.5);
+        Horosphere(w / norm, rng.sample(unif2), !parity)
+    }
+    
+    pub fn empty(self, side: Side) -> Self {
+        let Horosphere(_, _, parity) = self;
+        let mut w: na::Vector4<f64> = -*side.normal();
+        w[3] = (w[0]*w[0] + w[1]*w[1] + w[2]*w[2]).sqrt(); // Make sure center stays ideal point
+        let norm = w[3];
+        Horosphere(w / norm, 100.0, !parity)
     }
 
     pub fn solid_material(self) -> Option<Material> {
         match self {
             _ => None,
+        }
+    }
+    
+    fn continue_from(a: Self, b: Self, ab: Self, a_side: Side, b_side: Side) -> Self {
+        let Horosphere(_, _, parity_a) = a;
+        let Horosphere(_, _, parity_b) = b;
+        let Horosphere(_, _, parity_ab) = ab;
+        if parity_a == parity_b && parity_a == parity_ab{
+            return a.child_with_spice(a_side);
+        } else if parity_a != parity_b && parity_b == parity_ab {
+            return a.child_with_spice(a_side);
+        } else if parity_b != parity_a && parity_a == parity_ab {
+            return b.child_with_spice(b_side);
+        } else if parity_a == parity_b && parity_a != parity_ab {
+            return a.empty(a_side);
+        }
+        unreachable!()
+    }
+    
+    fn varied_from(parent: Self, side: Side, spice: u64, kind: NodeStateKind) -> Self {
+        let Horosphere(_, factor, _) = parent;
+        let mut rng = rand_pcg::Pcg64Mcg::seed_from_u64(spice);
+        let unif = Uniform::new_inclusive(0.0, 1.0);
+        if factor > 1.0 && rng.sample(unif) > 0.25 && kind != NodeStateKind::DeepLand && kind != NodeStateKind::Land {
+            return parent.new_child_with_spice(side, spice);
+        } else {
+            return parent.child_with_spice(side);
         }
     }
 }
@@ -99,7 +148,7 @@ impl NodeState {
     pub fn root() -> Self {
         Self {
             kind: NodeStateKind::ROOT,
-            horo: NodeStateHoro::ROOT,
+            horo: Horosphere(*Side::A.normal(), 100.0, false),
             surface: Plane::from(Side::A),
             road_state: NodeStateRoad::ROOT,
             spice: 0,
@@ -110,6 +159,10 @@ impl NodeState {
                 blockiness: 0.0,
             },
         }
+    }
+    
+    pub fn horo(&self) -> NodeStateHoro {
+        return self.horo;
     }
 
     pub fn child(&self, graph: &DualGraph, node: NodeId, side: Side) -> Self {
@@ -141,11 +194,32 @@ impl NodeState {
             }
             _ => unreachable!(),
         };
+        
+        let mut d2 = graph
+            .descenders(node)
+            .map(|(s, n)| (s, &graph.get(n).as_ref().unwrap().state));
 
         let child_kind = self.kind.child(side);
         let child_road = self.road_state.child(side, child_kind);
-        let child_horo = self.horo.child_with_spice(side);
 
+
+        let horo = match (d2.next(), d2.next()) {
+            (Some(_), None) => {
+                let parent_side = graph.parent(node).unwrap();
+                let parent_node = graph.neighbor(node, parent_side).unwrap();
+                let parent_state = &graph.get(parent_node).as_ref().unwrap().state;
+                NodeStateHoro::varied_from(parent_state.horo, parent_side, spice, child_kind)
+            }
+            (Some((a_side, a_state)), Some((b_side, b_state))) => {
+                let ab_node = graph
+                    .neighbor(graph.neighbor(node, a_side).unwrap(), b_side)
+                    .unwrap();
+                let ab_state = &graph.get(ab_node).as_ref().unwrap().state;
+                NodeStateHoro::continue_from(a_state.horo, b_state.horo, ab_state.horo, a_side, b_side)
+            }
+            _ => unreachable!(),
+        };
+        
         Self {
             kind: child_kind,
             surface: match child_kind {
@@ -156,7 +230,7 @@ impl NodeState {
             road_state: child_road,
             spice,
             enviro,
-            horo: child_horo,
+            horo,
         }
     }
 
@@ -260,8 +334,12 @@ impl ChunkParams {
         let center_elevation = self
             .surface
             .distance_to_chunk(self.chunk, &na::Vector3::repeat(0.5));
+        
+        
+        let Horosphere(center, factor, _) = self.horo;
+        let distance = Self::horosphere_distance(&center, factor, (0.5) / self.dimension as f64, (0.5) / self.dimension as f64, (0.5) / self.dimension as f64, self.chunk);
         if (center_elevation - ELEVATION_MARGIN > me_max / TERRAIN_SMOOTHNESS)
-            && !(self.is_road || self.is_road_support)
+            && !(self.is_road || self.is_road_support) && distance < -1.0
         {
             // The whole chunk is above ground and not part of the road
             return VoxelData::Solid(Material::Void);
@@ -474,7 +552,7 @@ impl ChunkParams {
     }
 
     fn generate_horosphere(&self, voxels: &mut VoxelData) {
-        let Horosphere(center, factor) = self.horo;
+        let Horosphere(center, factor, _) = self.horo;
         for (x, y, z) in VoxelCoords::new(self.dimension) {
             let coords = na::Vector3::new(x, y, z);
             let distance = Self::horosphere_distance(&center, factor, (x as f64 + 0.5) / self.dimension as f64, (y as f64 + 0.5) / self.dimension as f64, (z as f64 + 0.5) / self.dimension as f64, self.chunk);

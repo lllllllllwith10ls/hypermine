@@ -144,9 +144,8 @@ impl Window {
                     } else {
                         move_direction
                     });
-                    if jump_queued {
+                    if jump {
                         self.sim.jump();
-                        jump_queued = false;
                     }
 
                     self.sim.set_noclip(noclip);
