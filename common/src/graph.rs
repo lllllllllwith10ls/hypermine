@@ -98,6 +98,28 @@ impl Graph {
         (0..len).map(move |i| results[i].unwrap())
     }
 
+    /// Returns siblings, not including the self.
+    pub fn siblings(&self, node: NodeId) -> Vec<((Side, Side), Option<NodeId>)> {
+        let mut siblings = Vec::new();
+        for (parent_side, parent_node) in self.descenders(node) {
+            for sibling_side in Side::iter() {
+                if !sibling_side.adjacent_to(parent_side) {
+                    // We want edge-adjacent siblings only.
+                    continue;
+                }
+                if self.descenders(parent_node).any(|(s, _)| s == sibling_side) {
+                    // Grandparents are not siblings.
+                    continue;
+                }
+                siblings.push((
+                    (parent_side, sibling_side),
+                    self.neighbor(parent_node, sibling_side),
+                ));
+            }
+        }
+        siblings
+    }
+
     #[inline]
     pub fn get(&self, node: NodeId) -> &Option<Node> {
         &self.nodes[&node].value
@@ -158,6 +180,9 @@ impl Graph {
 
     /// Ensures that the neighbour node at a particular side of a particular node exists in the graph,
     /// as well as the nodes from the origin to the neighbour node.
+    // TODO: Some kind of ensure_peers is needed as well, ensuring that the node has all its peers, and
+    // the peers' parents have all their peers, etc.
+    // Such nodes otherwise will not necessarily generate naturally in certain routes the player could travel.
     pub fn ensure_neighbor(&mut self, node: NodeId, side: Side) -> NodeId {
         let v = &self.nodes[&node];
         if let Some(x) = v.neighbors[side as usize] {
