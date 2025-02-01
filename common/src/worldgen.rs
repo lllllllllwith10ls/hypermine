@@ -1,5 +1,5 @@
 use rand::{distributions::Uniform, Rng, SeedableRng};
-use rand_distr::Normal;
+use rand_distr::{num_traits::{AsPrimitive, ToPrimitive}, Normal};
 
 use crate::{
     dodeca::{Side, Vertex},
@@ -10,6 +10,7 @@ use crate::{
     terraingen::VoronoiInfo,
     world::Material,
     Plane,
+    Line,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -62,11 +63,129 @@ impl NodeStateRoad {
     }
 }
 
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum NodeState535 {
+    FundamentalDomain(MVector<f64>, MVector<f64>, MVector<f64>, MVector<f64>, MVector<f64>)
+}
+use std::f64::consts::PI;
+impl NodeState535 {
+
+    /// What state comes after this state, from a given side?
+    pub fn child(self, side: Side) -> Self {
+        let FundamentalDomain(v1, v2, v3, v4, p) = self;
+        let mut w1 = (*side.reflection_f64()*v1).lorentz_normalize();
+        let mut w2 = (*side.reflection_f64()*v2).lorentz_normalize();
+        let mut w3 = (*side.reflection_f64()*v3).lorentz_normalize();
+        let mut w4 = (*side.reflection_f64()*v4).lorentz_normalize();
+        let mut q = (*side.reflection_f64()*p).lorentz_normalize();
+        let mut in_domain = false;
+        let point = MVector::origin();
+        while !in_domain {
+            in_domain = true;
+            if point.mip(&w1) > 0. {
+                w1 = -w1;
+                w2 = w2 - w1*2.*w2.mip(&w1);
+                w3 = w3 - w1*2.*w3.mip(&w1);
+                w4 = w4 - w1*2.*w4.mip(&w1);
+                q = q - w1*2.*q.mip(&w1);
+                in_domain = false;
+            }
+            if point.mip(&w2) > 0. {
+                w1 = w1 - w2*2.*w1.mip(&w2);
+                w2 = -w2;
+                w3 = w3 - w2*2.*w3.mip(&w2);
+                w4 = w4 - w2*2.*w4.mip(&w2);
+                q = q - w2*2.*q.mip(&w2);
+                in_domain = false;
+            }
+            if point.mip(&w3) > 0. {
+                w1 = w1 - w3*2.*w1.mip(&w3);
+                w2 = w2 - w3*2.*w2.mip(&w3);
+                w3 = -w3;
+                w4 = w4 - w3*2.*w4.mip(&w3);
+                q = q - w3*2.*q.mip(&w3);
+                in_domain = false;
+            }
+            if point.mip(&w4) > 0. {
+                w1 = w1 - w4*2.*w1.mip(&w4);
+                w2 = w2 - w4*2.*w2.mip(&w4);
+                w3 = w3 - w4*2.*w3.mip(&w4);
+                w4 = -w4;
+                q = q - w4*2.*q.mip(&w4);
+                in_domain = false;
+            }
+            w1 = w1.lorentz_normalize();
+            w2 = w2.lorentz_normalize();
+            w3 = w3.lorentz_normalize();
+            w4 = w4.lorentz_normalize();
+            q = q.lorentz_normalize();
+        }
+        FundamentalDomain(w1, w2, w3, w4, q)
+    }
+    pub fn domain_point(self, point: MVector<f64>) -> MVector<f64> {
+        let FundamentalDomain(v1, v2, v3, v4, _) = self;
+        let mut in_domain = false;
+        let mut result = point;
+        while !in_domain {
+            in_domain = true;
+            if result.mip(&v1) > 0. {
+                result = result - v1*2.*result.mip(&v1);
+                in_domain = false;
+            }
+            if result.mip(&v2) > 0. {
+                result = result - v2*2.*result.mip(&v2);
+                in_domain = false;
+            }
+            if result.mip(&v3) > 0. {
+                result = result - v3*2.*result.mip(&v3);
+                in_domain = false;
+            }
+            if result.mip(&v4) > 0. {
+                result = result - v4*2.*result.mip(&v4);
+                in_domain = false;
+            }
+        }
+        result
+    }
+    pub fn fundamental_domain(ab: usize, bc: usize, cd: usize, ac: usize, ad: usize, bd: usize, m0: f64, m1: f64, m2: f64, m3: f64) -> Self {
+        let c01 = -(PI / ab.to_f64().unwrap()).cos();
+        let c02 = -(PI / ac.to_f64().unwrap()).cos();
+        let c03 = -(PI / ad.to_f64().unwrap()).cos();
+        let c12 = -(PI / bc.to_f64().unwrap()).cos();
+        let c13 = -(PI / bd.to_f64().unwrap()).cos();
+        let c23 = -(PI / cd.to_f64().unwrap()).cos();
+        
+        let a = na::Vector4::<f64>::new(1., 0., 0., 0.);
+        let b = na::Vector4::<f64>::new(c01, (1. - c01*c01).sqrt(), 0., 0.);
+        let mut c = na::Vector4::<f64>::new(c02, 0., 0., 0.);
+        c.y = (c12 - c.x * b.x) / b.y;
+        c.z = (1. - c.x * c.x - c.y * c.y).abs().sqrt();
+        let mut d = na::Vector4::<f64>::new(c03, 0., 0., 0.);
+        d.y = (c13 - d.x * b.x) / b.y;
+        d.z = (c23 - d.x * c.x - d.y * c.y) / c.z;
+        d.w = ((d.xyz().dot(&d.xyz()) - 1.).abs()).sqrt();
+        let signature = na::Matrix4::<f64>::new(
+            1.,0.,0.,0.,
+            0.,1.,0.,0.,
+            0.,0.,1.,0.,
+            0.,0.,0.,-1.
+        );
+        let matrix = (signature * na::Matrix4::<f64>::from_columns(&[a,b,c,d])).try_inverse().unwrap().transpose();
+        let v = matrix * na::Vector4::<f64>::new(m0, m1, m2, m3);
+        FundamentalDomain(MVector::from(a),MVector::from(b),MVector::from(c),MVector::from(d),MVector::from(v))
+        
+    }
+}
+
+use NodeState535::*;
+
 pub struct NodeState {
     kind: NodeStateKind,
     surface: Plane<f64>,
     road_state: NodeStateRoad,
     enviro: EnviroFactors,
+    grid: NodeState535,
 }
 impl NodeState {
     pub fn root() -> Self {
@@ -80,6 +199,7 @@ impl NodeState {
                 rainfall: 0.0,
                 blockiness: 0.0,
             },
+            grid: NodeState535::fundamental_domain(5, 3, 5, 2, 2, 2, 0., 0., 0., 1.),
         }
     }
 
@@ -107,6 +227,7 @@ impl NodeState {
 
         let child_kind = self.kind.child(side);
         let child_road = self.road_state.child(side);
+        let child_grid = self.grid.child(side);
 
         Self {
             kind: child_kind,
@@ -117,6 +238,7 @@ impl NodeState {
             },
             road_state: child_road,
             enviro,
+            grid: child_grid,
         }
     }
 
@@ -176,6 +298,8 @@ pub struct ChunkParams {
     is_road_support: bool,
     /// Random quantity used to seed terrain gen
     node_spice: u64,
+    /// The grid of dodecahedra
+    grid: NodeState535,
 }
 
 impl ChunkParams {
@@ -194,6 +318,7 @@ impl ChunkParams {
             is_road_support: ((state.kind == Land) || (state.kind == DeepLand))
                 && ((state.road_state == East) || (state.road_state == West)),
             node_spice: graph.hash_of(chunk.node) as u64,
+            grid: state.grid.clone(), 
         })
     }
 
@@ -218,7 +343,7 @@ impl ChunkParams {
             .surface
             .distance_to_chunk(self.chunk, &na::Vector3::repeat(0.5));
         if (center_elevation - ELEVATION_MARGIN > me_max / TERRAIN_SMOOTHNESS)
-            && !(self.is_road || self.is_road_support)
+            && !(self.is_road || self.is_road_support) && false
         {
             // The whole chunk is above ground and not part of the road
             return VoxelData::Solid(Material::Void);
@@ -246,6 +371,8 @@ impl ChunkParams {
         if self.dimension > 4 && matches!(voxels, VoxelData::Dense(_)) {
             self.generate_trees(&mut voxels, &mut rng);
         }
+
+        self.generate_grid(&mut voxels);
 
         margins::initialize_margins(self.dimension, &mut voxels);
         voxels
@@ -456,6 +583,21 @@ impl ChunkParams {
         NeighborData {
             coords_opposing,
             material,
+        }
+    }
+
+    
+    fn generate_grid(&self, voxels: &mut VoxelData) {
+        for (x, y, z) in VoxelCoords::new(self.dimension) {
+            let coords = na::Vector3::new(x, y, z);
+            let coords2 = (coords.map(|x| f64::from(x) + 0.5) / f64::from(self.dimension)).push(1.0);
+            let center = MVector::from(self.chunk.chunk_to_node_f64() * coords2).lorentz_normalize();
+            let point = self.grid.domain_point(center);
+            let FundamentalDomain(_,_,_,v,origin) = self.grid;
+            let line = Line::from_points(&origin, &(origin - v*2.*origin.mip(&v)));
+            if line.distance_to(&point) < 0.2 {
+                voxels.data_mut(self.dimension)[index(self.dimension, coords)] = Material::Lava;
+            }
         }
     }
 }
