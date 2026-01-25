@@ -99,7 +99,7 @@ impl LocalCharacterController {
         }
     }
 
-    /// Instantly updates the current orientation quaternion to make the camera level. This function
+    /// Updates the current orientation quaternion to make the camera level. This function
     /// is designed to be numerically stable for any camera orientation.
     pub fn align_to_gravity(&mut self) {
         // Get orientation-relative up
@@ -109,17 +109,12 @@ impl LocalCharacterController {
             // If facing not too vertically, roll the camera to make it level.
             let delta_roll = -up.x.atan2(up.y);
             self.orientation *=
-                na::UnitQuaternion::from_axis_angle(&na::Vector3::z_axis(), delta_roll);
-        } else if up.y > 0.0 {
-            // Otherwise, if not upside-down, yaw the camera to make it level.
-            let delta_yaw = (up.x / up.z).atan();
-            self.orientation *=
-                na::UnitQuaternion::from_axis_angle(&na::Vector3::y_axis(), delta_yaw);
+                na::UnitQuaternion::from_axis_angle(&na::Vector3::z_axis(), delta_roll * 0.025);
         } else {
-            // Otherwise, rotate the camera to look straight up or down.
+            // Otherwise, if not upside-down, yaw the camera to make it level.
+            let delta_yaw = up.x.atan2(up.z);
             self.orientation *=
-                na::UnitQuaternion::rotation_between(&(na::Vector3::z() * up.z.signum()), &up)
-                    .unwrap();
+                na::UnitQuaternion::from_axis_angle(&na::Vector3::y_axis(), delta_yaw * 0.025);
         }
     }
 

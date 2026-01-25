@@ -503,7 +503,7 @@ impl Sim {
         self.local_character_controller.update_position(
             view_position,
             self.graph.get_relative_up(&view_position).unwrap(),
-            !self.no_clip,
+            false,
         )
     }
 
