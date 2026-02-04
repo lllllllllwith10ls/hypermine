@@ -6,21 +6,21 @@ use tracing::{debug, error, trace};
 
 use crate::{
     local_character_controller::LocalCharacterController, metrics, prediction::PredictedMotion,
+    worldgen_driver::WorldgenDriver,
 };
 use common::{
-    character_controller,
+    EntityId, GraphEntities, SimConfig, Step, character_controller,
     collision_math::Ray,
     graph::{Graph, NodeId},
-    graph_ray_casting, math,
-    math::{MIsometry, MVector},
-    node::{populate_fresh_nodes, ChunkId, VoxelData},
+    graph_ray_casting,
+    math::{MDirection, MIsometry, MPoint},
+    node::VoxelData,
     proto::{
         self, BlockUpdate, Character, CharacterInput, CharacterState, Command, Component,
         Inventory, Position,
     },
     sanitize_motion_input,
     world::Material,
-    EntityId, GraphEntities, SimConfig, Step,
 };
 
 const MATERIAL_PALETTE: [Material; 10] = [
@@ -40,8 +40,8 @@ const MATERIAL_PALETTE: [Material; 10] = [
 pub struct Sim {
     // World state
     pub graph: Graph,
-    /// Voxel data that have been downloaded from the server for chunks not yet introduced to the graph
-    pub preloaded_block_updates: FxHashMap<ChunkId, Vec<BlockUpdate>>,
+    /// Drives chunk generation
+    worldgen_driver: WorldgenDriver,
     pub graph_entities: GraphEntities,
     entity_ids: FxHashMap<EntityId, Entity>,
     pub world: hecs::World,
@@ -82,12 +82,16 @@ pub struct Sim {
 }
 
 impl Sim {
-    pub fn new(cfg: SimConfig, local_character_id: EntityId) -> Self {
+    pub fn new(
+        cfg: SimConfig,
+        chunk_load_parallelism: usize,
+        local_character_id: EntityId,
+    ) -> Self {
         let mut graph = Graph::new(cfg.chunk_size);
-        populate_fresh_nodes(&mut graph);
+        graph.ensure_node_state(NodeId::ROOT);
         Self {
             graph,
-            preloaded_block_updates: FxHashMap::default(),
+            worldgen_driver: WorldgenDriver::new(chunk_load_parallelism),
             graph_entities: GraphEntities::new(),
             entity_ids: FxHashMap::default(),
             world: hecs::World::new(),
@@ -218,6 +222,11 @@ impl Sim {
 
     pub fn step(&mut self, dt: Duration, net: &mut server::Handle) {
         self.local_character_controller.renormalize_orientation();
+        self.worldgen_driver.drive(
+            self.view(),
+            self.cfg.chunk_generation_distance,
+            &mut self.graph,
+        );
 
         let step_interval = self.cfg.step_interval;
         self.since_input_sent += dt;
@@ -277,7 +286,7 @@ impl Sim {
             Spawns(msg) => self.handle_spawns(msg),
             StateDelta(msg) => {
                 // Discard out-of-order messages, taking care to account for step counter wrapping.
-                if self.step.map_or(false, |x| x.wrapping_sub(msg.step) >= 0) {
+                if self.step.is_some_and(|x| x.wrapping_sub(msg.step) >= 0) {
                     return;
                 }
                 self.step = Some(msg.step);
@@ -371,23 +380,23 @@ impl Sim {
             metrics::declare_ready_for_profiling();
         }
         for node in &msg.nodes {
-            self.graph.insert_neighbor(node.parent, node.side);
+            // We need to get a list of nodes from the server, especially on first log-in,
+            // since otherwise, we won't be able to know where the local character is with
+            // just the NodeId alone.
+            let node_id = self.graph.ensure_neighbor(node.parent, node.side);
+            self.graph.ensure_node_state(node_id);
         }
-        populate_fresh_nodes(&mut self.graph);
         for block_update in msg.block_updates.into_iter() {
-            if !self.graph.update_block(&block_update) {
-                self.preloaded_block_updates
-                    .entry(block_update.chunk_id)
-                    .or_default()
-                    .push(block_update);
-            }
+            self.worldgen_driver
+                .apply_block_update(&mut self.graph, block_update);
         }
         for (chunk_id, voxel_data) in msg.voxel_data {
             let Some(voxel_data) = VoxelData::deserialize(&voxel_data, self.cfg.chunk_size) else {
                 tracing::error!("Voxel data received from server is of incorrect dimension");
                 continue;
             };
-            self.graph.populate_chunk(chunk_id, voxel_data);
+            self.worldgen_driver
+                .apply_voxel_data(&mut self.graph, chunk_id, voxel_data);
         }
         for (subject, new_entity) in msg.inventory_additions {
             self.world
@@ -510,8 +519,9 @@ impl Sim {
     pub fn view(&self) -> Position {
         let mut pos = self.local_character_controller.oriented_position();
         let up = self.graph.get_relative_up(&pos).unwrap();
-        pos.local *=
-            math::translate_along(&(up.as_ref() * (self.cfg.character.character_radius - 1e-3)));
+        pos.local *= MIsometry::translation_along(
+            &(up.as_ref() * (self.cfg.character.character_radius - 1e-3)),
+        );
         pos
     }
 
@@ -549,7 +559,7 @@ impl Sim {
         let ray_casing_result = graph_ray_casting::ray_cast(
             &self.graph,
             &view_position,
-            &Ray::new(MVector::w(), -MVector::z()),
+            &Ray::new(MPoint::w(), -MDirection::z()),
             self.cfg.character.block_reach,
         );
 

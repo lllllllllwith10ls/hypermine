@@ -1,19 +1,19 @@
 use std::{
     borrow::Cow,
-    fs,
-    fs::File,
+    fs::{self, File},
+    io::Cursor,
     mem,
     path::{Path, PathBuf},
     ptr,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use ash::vk;
-use futures_util::future::{try_join_all, BoxFuture, FutureExt};
+use futures_util::future::{BoxFuture, FutureExt, try_join_all};
 use lahar::{BufferRegionAlloc, DedicatedImage};
 use tracing::{error, trace};
 
-use super::{meshes::Vertex, Base, Mesh};
+use super::{Base, Mesh, meshes::Vertex};
 use crate::loader::{Cleanup, LoadCtx, LoadFuture, Loadable};
 
 pub struct GlbFile {
@@ -69,8 +69,10 @@ pub struct GltfScene(pub Vec<Mesh>);
 
 impl Cleanup for GltfScene {
     unsafe fn cleanup(self, gfx: &Base) {
-        for mesh in self.0 {
-            mesh.cleanup(gfx);
+        unsafe {
+            for mesh in self.0 {
+                mesh.cleanup(gfx);
+            }
         }
     }
 }
@@ -242,10 +244,7 @@ async fn load_geom(
         .read_normals()
         .ok_or_else(|| anyhow!("normals missing"))?;
     let vertex_count = positions.len();
-    if vertex_count != normals.len()
-        || texcoords
-            .as_ref()
-            .map_or(false, |x| vertex_count != x.len())
+    if vertex_count != normals.len() || texcoords.as_ref().is_some_and(|x| vertex_count != x.len())
     {
         bail!("inconsistent vertex attribute counts");
     }
@@ -388,7 +387,7 @@ async fn load_material(
                 ctx,
                 prim.material().pbr_metallic_roughness().base_color_factor(),
             )
-            .await
+            .await;
         }
         Some(x) => x,
     };
@@ -412,7 +411,7 @@ async fn load_material(
         }
     };
     let mut color_data = &color_data[..];
-    let mut color_reader = png::Decoder::new(&mut color_data)
+    let mut color_reader = png::Decoder::new(Cursor::new(&mut color_data))
         .read_info()
         .with_context(|| "decoding PNG header")?;
     let (width, height) = {

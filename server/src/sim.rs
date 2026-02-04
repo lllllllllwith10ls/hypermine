@@ -6,7 +6,7 @@ use common::math::MIsometry;
 use common::node::VoxelData;
 use common::proto::{BlockUpdate, Inventory, SerializedVoxelData};
 use common::world::Material;
-use common::{node::ChunkId, GraphEntities};
+use common::{GraphEntities, node::ChunkId};
 use fxhash::{FxHashMap, FxHashSet};
 use hecs::{DynamicBundle, Entity, EntityBuilder};
 use rand::rngs::SmallRng;
@@ -16,17 +16,15 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, error_span, info, trace};
 
 use common::{
-    character_controller, dodeca,
+    EntityId, SimConfig, Step, character_controller, dodeca,
     graph::{Graph, NodeId},
-    math,
-    node::{populate_fresh_nodes, Chunk},
+    node::Chunk,
     proto::{
         Character, CharacterInput, CharacterState, ClientHello, Command, Component, FreshNode,
         Position, Spawns, StateDelta,
     },
     traversal::{ensure_nearby, nearby_nodes},
     worldgen::ChunkParams,
-    EntityId, SimConfig, Step,
 };
 
 use crate::postcard_helpers::{self, SaveEntity};
@@ -46,14 +44,15 @@ pub struct Sim {
     dirty_nodes: FxHashSet<NodeId>,
     /// All nodes that have voxel-related information yet to be saved
     dirty_voxel_nodes: FxHashSet<NodeId>,
-    /// All chunks that have ever had any block updates applied to them and can no longer be regenerated with worldgen
+    /// All chunks in the graph have ever had any block updates applied to them and can no longer be regenerated with worldgen.
+    /// This doesn't include chunks that have not been added to the graph yet (See `preloaded_voxel_data`).
     modified_chunks: FxHashSet<ChunkId>,
 }
 
 impl Sim {
     pub fn new(cfg: Arc<SimConfig>, save: &save::Save) -> Self {
         let mut result = Self {
-            rng: SmallRng::from_entropy(),
+            rng: SmallRng::from_os_rng(),
             step: 0,
             entity_ids: FxHashMap::default(),
             world: hecs::World::new(),
@@ -73,8 +72,6 @@ impl Sim {
         result
             .load_all_entities(save)
             .expect("save file must be of a valid format");
-        // Loading entities can cause graph nodes to also be created, so we should populate them before returning.
-        result.populate_fresh_graph_nodes();
         // As no players have logged in yet, and `snapshot` may be called before the first call of `step`,
         // make sure that `accumulated_changes` is empty to avoid accidental double-spawns of anything.
         result.accumulated_changes = AccumulatedChanges::default();
@@ -84,9 +81,9 @@ impl Sim {
     pub fn save(&mut self, save: &mut save::Save) -> Result<(), save::DbError> {
         fn path_from_origin(graph: &Graph, mut node: NodeId) -> Vec<u8> {
             let mut result = Vec::new();
-            while let Some(parent) = graph.parent(node) {
-                result.push(parent as u8);
-                node = graph.neighbor(node, parent).unwrap();
+            while let Some(primary_parent) = graph.primary_parent_side(node) {
+                result.push(primary_parent as u8);
+                node = graph.neighbor(node, primary_parent).unwrap();
             }
             result.reverse();
             result
@@ -94,7 +91,7 @@ impl Sim {
 
         let mut tx = save.write()?;
         let mut writer = tx.get()?;
-        for (_, (pos, ch)) in self.world.query::<(&Position, &Character)>().iter() {
+        for (pos, ch) in self.world.query::<(&Position, &Character)>().iter() {
             writer.put_character(
                 &ch.name,
                 &save::Character {
@@ -121,8 +118,6 @@ impl Sim {
 
     /// Loads all entities from the given save file. Note that this must be called before any players
     /// log in, as `accumulated_changes` will not properly reflect the entities that were loaded in.
-    /// It is also important to call `populate_fresh_graph_nodes` after calling this function to keep
-    /// `Sim` in a consistent state, as this function can expand the graph without populating the graph nodes.
     fn load_all_entities(&mut self, save: &save::Save) -> anyhow::Result<()> {
         let mut read = save.read()?;
         for node_hash in read.get_all_entity_node_ids()? {
@@ -147,6 +142,7 @@ impl Sim {
         let entity_id = EntityId::from_bits(u64::from_le_bytes(save_entity.entity));
         let mut entity_builder = EntityBuilder::new();
         entity_builder.add(entity_id);
+        entity_builder.add(node);
         for (component_type, component_bytes) in save_entity.components {
             self.load_component(
                 read,
@@ -183,14 +179,17 @@ impl Sim {
                 // Ensure that every node occupied by a character is generated.
                 let Some(character) = read.get_character(&name)? else {
                     // Skip loading named entities that lack path information.
-                    error!("Entity {} will not be loaded because their node path information is missing.", name);
+                    error!(
+                        "Entity {} will not be loaded because their node path information is missing.",
+                        name
+                    );
                     return Ok(());
                 };
                 let mut current_node = NodeId::ROOT;
                 for side in character
                     .path
                     .into_iter()
-                    .map(|side| Side::from_index(side as usize))
+                    .map(|side| Side::VALUES[side as usize])
                 {
                     current_node = self.graph.ensure_neighbor(current_node, side);
                 }
@@ -198,7 +197,10 @@ impl Sim {
                     // Skip loading named entities that are in the wrong place. This can happen
                     // when there are multiple entities with the same name, which has been possible
                     // in previous versions of Hypermine.
-                    error!("Entity {} will not be loaded because their node path information is incorrect.", name);
+                    error!(
+                        "Entity {} will not be loaded because their node path information is incorrect.",
+                        name
+                    );
                     return Ok(());
                 }
                 // Prepare all relevant components that are needed to support ComponentType::Name
@@ -210,7 +212,22 @@ impl Sim {
                         orientation: na::UnitQuaternion::identity(),
                     },
                 }));
-                entity_builder.add(Inventory { contents: vec![] });
+            }
+            ComponentType::Material => {
+                let material: u16 =
+                    u16::from_le_bytes(component_bytes.try_into().map_err(|_| {
+                        anyhow::anyhow!("Expected Material component in save file to be 2 bytes")
+                    })?);
+                entity_builder.add(Material::try_from(material)?);
+            }
+            ComponentType::Inventory => {
+                let mut contents = vec![];
+                for chunk in component_bytes.chunks(8) {
+                    contents.push(EntityId::from_bits(u64::from_le_bytes(
+                        chunk.try_into().unwrap(),
+                    )));
+                }
+                entity_builder.add(Inventory { contents });
             }
         }
         Ok(())
@@ -263,6 +280,23 @@ impl Sim {
             }) {
                 components.push((ComponentType::Name as u64, ch.name.as_bytes().into()));
             }
+            if let Some(material) = entity.get::<&Material>() {
+                components.push((
+                    ComponentType::Material as u64,
+                    (*material as u16).to_le_bytes().into(),
+                ));
+            }
+            if let Some(inventory) = entity.get::<&Inventory>() {
+                let mut serialized_inventory_contents = vec![];
+                for entity_id in &inventory.contents {
+                    serialized_inventory_contents
+                        .extend_from_slice(&entity_id.to_bits().to_le_bytes());
+                }
+                components.push((
+                    ComponentType::Inventory as u64,
+                    serialized_inventory_contents,
+                ));
+            }
             let mut repr = Vec::new();
             postcard_helpers::serialize(
                 &SaveEntity {
@@ -280,7 +314,7 @@ impl Sim {
 
     fn snapshot_voxel_node(&self, node: NodeId) -> save::VoxelNode {
         let mut chunks = vec![];
-        let node_data = self.graph.get(node).as_ref().unwrap();
+        let node_data = &self.graph[node];
         for vertex in Vertex::iter() {
             if !self.modified_chunks.contains(&ChunkId::new(node, vertex)) {
                 continue;
@@ -307,7 +341,7 @@ impl Sim {
             .world
             .query::<&Character>()
             .iter()
-            .any(|(_, character)| character.name == hello.name)
+            .any(|character| character.name == hello.name)
         {
             return None;
         }
@@ -315,10 +349,10 @@ impl Sim {
         // Check for matching characters
         let matching_character = self
             .world
-            .query::<(&EntityId, &InactiveCharacter)>()
+            .query::<(Entity, &EntityId, &InactiveCharacter)>()
             .iter()
-            .find(|(_, (_, inactive_character))| inactive_character.0.name == hello.name)
-            .map(|(entity, (entity_id, _))| (*entity_id, entity));
+            .find(|(_, _, inactive_character)| inactive_character.0.name == hello.name)
+            .map(|(entity, entity_id, _)| (*entity_id, entity));
         if let Some((entity_id, entity)) = matching_character {
             info!(id = %entity_id, name = %hello.name, "activating character");
             let inactive_character = self.world.remove_one::<InactiveCharacter>(entity).unwrap();
@@ -332,7 +366,7 @@ impl Sim {
         // Spawn entirely new character
         let position = Position {
             node: NodeId::ROOT,
-            local: math::translate_along(&(na::Vector3::y() * 1.4)),
+            local: MIsometry::translation_along(&(na::Vector3::y() * 1.4)),
         };
         let character = Character {
             name: hello.name.clone(),
@@ -344,7 +378,7 @@ impl Sim {
         };
         let inventory = Inventory { contents: vec![] };
         let initial_input = CharacterInput::default();
-        Some(self.spawn((position, character, inventory, initial_input)))
+        Some(self.spawn((position.node, position, character, inventory, initial_input)))
     }
 
     pub fn deactivate_character(&mut self, entity: Entity) {
@@ -356,7 +390,20 @@ impl Sim {
         self.world
             .insert_one(entity, InactiveCharacter(character))
             .unwrap();
-        self.accumulated_changes.despawns.push(entity_id);
+        if let Some(index) = self
+            .accumulated_changes
+            .spawns
+            .iter()
+            .position(|e| *e == entity)
+        {
+            // Ensure that the same entity does not show up in the spawns
+            // and despawns list if the character entity is spawned and deactivated
+            // in the same frame. This can happen if a client connects and
+            // immediately disconnects due to an error.
+            self.accumulated_changes.spawns.remove(index);
+        } else {
+            self.accumulated_changes.despawns.push(entity_id);
+        }
     }
 
     fn spawn(&mut self, bundle: impl DynamicBundle) -> (EntityId, Entity) {
@@ -366,9 +413,9 @@ impl Sim {
         entity_builder.add_bundle(bundle);
         let entity = self.world.spawn(entity_builder.build());
 
-        if let Ok(position) = self.world.get::<&Position>(entity) {
-            self.graph_entities.insert(position.node, entity);
-            self.dirty_nodes.insert(position.node);
+        if let Ok(node) = self.world.get::<&NodeId>(entity) {
+            self.graph_entities.insert(*node, entity);
+            self.dirty_nodes.insert(*node);
         }
 
         if let Ok(character) = self.world.get::<&Character>(entity) {
@@ -377,7 +424,7 @@ impl Sim {
 
         self.entity_ids.insert(id, entity);
 
-        if !self.world.satisfies::<&InactiveCharacter>(entity).unwrap() {
+        if !self.world.satisfies::<&InactiveCharacter>(entity) {
             self.accumulated_changes.spawns.push(entity);
         }
 
@@ -399,10 +446,10 @@ impl Sim {
     pub fn destroy(&mut self, entity: Entity) {
         let id = *self.world.get::<&EntityId>(entity).unwrap();
         self.entity_ids.remove(&id);
-        if let Ok(position) = self.world.get::<&Position>(entity) {
-            self.graph_entities.remove(position.node, entity);
+        if let Ok(node) = self.world.get::<&NodeId>(entity) {
+            self.graph_entities.remove(*node, entity);
         }
-        if !self.world.satisfies::<&InactiveCharacter>(entity).unwrap() {
+        if !self.world.satisfies::<&InactiveCharacter>(entity) {
             self.accumulated_changes.despawns.push(id);
         }
         self.world.despawn(entity).unwrap();
@@ -426,17 +473,21 @@ impl Sim {
         };
         for (entity, &id) in &mut self
             .world
-            .query::<hecs::Without<&EntityId, &InactiveCharacter>>()
+            .query::<hecs::Without<(Entity, &EntityId), &InactiveCharacter>>()
         {
             spawns.spawns.push((id, dump_entity(&self.world, entity)));
         }
         for &chunk_id in self.modified_chunks.iter() {
-            let voxels =
-                match self.graph.get(chunk_id.node).as_ref().unwrap().chunks[chunk_id.vertex] {
-                    Chunk::Populated { ref voxels, .. } => voxels,
-                    _ => panic!("ungenerated chunk is marked as modified"),
-                };
+            let voxels = match self.graph[chunk_id] {
+                Chunk::Populated { ref voxels, .. } => voxels,
+                _ => panic!("ungenerated chunk is marked as modified"),
+            };
 
+            spawns
+                .voxel_data
+                .push((chunk_id, voxels.serialize(self.cfg.chunk_size)));
+        }
+        for (&chunk_id, voxels) in self.preloaded_voxel_data.iter() {
             spawns
                 .voxel_data
                 .push((chunk_id, voxels.serialize(self.cfg.chunk_size)));
@@ -448,17 +499,9 @@ impl Sim {
         let span = error_span!("step", step = self.step);
         let _guard = span.enter();
 
-        // Extend graph structure
-        for (_, (position, _)) in self.world.query::<(&mut Position, &mut Character)>().iter() {
-            ensure_nearby(&mut self.graph, position, self.cfg.view_distance);
-        }
-
-        self.populate_fresh_graph_nodes();
-
         // We want to load all chunks that a player can interact with in a single step, so chunk_generation_distance
         // is set up to cover that distance.
-        let chunk_generation_distance = dodeca::BOUNDING_SPHERE_RADIUS
-            + self.cfg.character.character_radius
+        let chunk_generation_distance = self.cfg.character.character_radius
             + self.cfg.character.speed_cap * self.cfg.step_interval.as_secs_f32()
             + self.cfg.character.ground_distance_tolerance
             + self.cfg.character.block_reach
@@ -466,21 +509,21 @@ impl Sim {
 
         // Load all chunks around entities corresponding to clients, which correspond to entities
         // with a "Character" component.
-        for (_, (position, _)) in self.world.query::<(&Position, &Character)>().iter() {
+        for (position, _) in self.world.query::<(&Position, &Character)>().iter() {
+            ensure_nearby(&mut self.graph, position, chunk_generation_distance);
             let nodes = nearby_nodes(&self.graph, position, chunk_generation_distance);
             for &(node, _) in &nodes {
                 for vertex in dodeca::Vertex::iter() {
                     let chunk = ChunkId::new(node, vertex);
-                    if let Chunk::Fresh = self
-                        .graph
-                        .get_chunk(chunk)
-                        .expect("all nodes must be populated before loading their chunks")
-                    {
-                        if let Some(params) =
-                            ChunkParams::new(self.cfg.chunk_size, &self.graph, chunk)
-                        {
-                            self.graph.populate_chunk(chunk, params.generate_voxels());
-                        }
+                    if !matches!(self.graph[chunk], Chunk::Fresh) {
+                        continue;
+                    }
+                    if let Some(voxel_data) = self.preloaded_voxel_data.remove(&chunk) {
+                        self.modified_chunks.insert(chunk);
+                        self.graph.populate_chunk(chunk, voxel_data);
+                    } else {
+                        let params = ChunkParams::new(&mut self.graph, chunk);
+                        self.graph.populate_chunk(chunk, params.generate_voxels());
                     }
                 }
             }
@@ -489,12 +532,17 @@ impl Sim {
         let mut pending_block_updates: Vec<(Entity, BlockUpdate)> = vec![];
 
         // Simulate
-        for (entity, (position, character, input)) in self
+        for (entity, node, position, character, input) in self
             .world
-            .query::<(&mut Position, &mut Character, &CharacterInput)>()
+            .query::<(
+                Entity,
+                &NodeId,
+                &mut Position,
+                &mut Character,
+                &CharacterInput,
+            )>()
             .iter()
         {
-            let prev_node = position.node;
             character_controller::run_character_step(
                 &self.cfg,
                 &self.graph,
@@ -507,18 +555,15 @@ impl Sim {
             if let Some(block_update) = input.block_update.clone() {
                 pending_block_updates.push((entity, block_update));
             }
-            if prev_node != position.node {
-                self.dirty_nodes.insert(prev_node);
-                self.graph_entities.remove(prev_node, entity);
-                self.graph_entities.insert(position.node, entity);
-            }
-            self.dirty_nodes.insert(position.node);
+            self.dirty_nodes.insert(*node);
         }
 
         for (entity, block_update) in pending_block_updates {
             let id = *self.world.get::<&EntityId>(entity).unwrap();
             self.attempt_block_update(id, block_update);
         }
+
+        self.update_entity_node_ids();
 
         let spawns = std::mem::take(&mut self.accumulated_changes).into_spawns(
             self.step,
@@ -534,13 +579,13 @@ impl Sim {
                 .world
                 .query::<(&EntityId, &Position)>()
                 .iter()
-                .map(|(_, (&id, &position))| (id, position))
+                .map(|(&id, &position)| (id, position))
                 .collect(),
             character_states: self
                 .world
                 .query::<(&EntityId, &Character)>()
                 .iter()
-                .map(|(_, (&id, ch))| (id, ch.state.clone()))
+                .map(|(&id, ch)| (id, ch.state.clone()))
                 .collect(),
         };
 
@@ -548,32 +593,56 @@ impl Sim {
         (spawns, delta)
     }
 
-    /// Should be called after any set of changes is made to the graph to ensure that the server
-    /// does not have any partially-initialized graph nodes.
-    fn populate_fresh_graph_nodes(&mut self) {
-        let fresh_nodes = self.graph.fresh().to_vec();
-        populate_fresh_nodes(&mut self.graph);
+    /// Ensure that the NodeId component of every entity is set to what it should be to ensure consistency. Any entity
+    /// with a position should have a NodeId that matches that position, and all entities with inventories should propagate
+    /// their NodeId to their inventory items.
+    fn update_entity_node_ids(&mut self) {
+        // Helper function for properly changing the NodeId of a given node without leaving any
+        // of the supporting structures out of date.
+        let mut update_node_id = |entity: Entity, node_id: &mut NodeId, new_node_id: NodeId| {
+            if *node_id != new_node_id {
+                self.dirty_nodes.insert(*node_id);
+                self.graph_entities.remove(*node_id, entity);
 
-        self.accumulated_changes
-            .fresh_nodes
-            .extend_from_slice(&fresh_nodes);
-        for fresh_node in fresh_nodes.iter().copied() {
-            for vertex in Vertex::iter() {
-                let chunk = ChunkId::new(fresh_node, vertex);
-                if let Some(voxel_data) = self.preloaded_voxel_data.remove(&chunk) {
-                    self.accumulated_changes
-                        .fresh_voxel_data
-                        .push((chunk, voxel_data.serialize(self.cfg.chunk_size)));
-                    self.modified_chunks.insert(chunk);
-                    self.graph.populate_chunk(chunk, voxel_data)
-                }
+                *node_id = new_node_id;
+                self.dirty_nodes.insert(*node_id);
+                self.graph_entities.insert(*node_id, entity);
+            }
+        };
+
+        // Synchronize NodeId and Position
+        for (entity, node_id, position) in self
+            .world
+            .query::<(Entity, &mut NodeId, &Position)>()
+            .iter()
+        {
+            update_node_id(entity, node_id, position.node);
+        }
+
+        // Synchronize NodeId for all inventory items.
+        // TODO: Note that the order in which inventory items are updated is arbitrary, so
+        // if inventory items can themselves have inventories, their respective NodeIds
+        // may be out of date by a few steps, which could cause bugs. This can be solved with
+        // a more complete entity hierarchy system
+        for (&inventory_node_id, inventory) in self.world.query::<(&NodeId, &Inventory)>().iter() {
+            for inventory_entity_id in &inventory.contents {
+                let inventory_entity = *self.entity_ids.get(inventory_entity_id).unwrap();
+
+                let mut inventory_entity_node_id =
+                    self.world.get::<&mut NodeId>(inventory_entity).unwrap();
+
+                update_node_id(
+                    inventory_entity,
+                    &mut inventory_entity_node_id,
+                    inventory_node_id,
+                );
             }
         }
     }
 
     fn new_id(&mut self) -> EntityId {
         loop {
-            let id = self.rng.gen();
+            let id = self.rng.random();
             if !self.entity_ids.contains_key(&id) {
                 return id;
             }
@@ -612,6 +681,10 @@ impl Sim {
     /// Executes the requested block update if the subject is able to do so and
     /// leaves the state of the world unchanged otherwise
     fn attempt_block_update(&mut self, subject: EntityId, block_update: BlockUpdate) {
+        let subject_node = *self
+            .world
+            .get::<&NodeId>(*self.entity_ids.get(&subject).unwrap())
+            .unwrap();
         let Some(old_material) = self
             .graph
             .get_material(block_update.chunk_id, block_update.coords)
@@ -644,7 +717,7 @@ impl Sim {
                 self.destroy(consumed_entity);
             }
             if old_material != Material::Void {
-                let (produced_entity, _) = self.spawn((old_material,));
+                let (produced_entity, _) = self.spawn((subject_node, old_material));
                 self.add_to_inventory(subject, produced_entity);
             }
         }
@@ -658,7 +731,7 @@ impl Sim {
 /// Collect all information about a particular entity for transmission to clients.
 fn dump_entity(world: &hecs::World, entity: Entity) -> Vec<Component> {
     assert!(
-        !world.satisfies::<&InactiveCharacter>(entity).unwrap(),
+        !world.satisfies::<&InactiveCharacter>(entity),
         "Inactive characters should not be sent to clients"
     );
     let mut components = Vec::new();
@@ -702,10 +775,6 @@ struct AccumulatedChanges {
 
     /// Nodes that have been added to the graph since the last broadcast
     fresh_nodes: Vec<NodeId>,
-
-    /// Voxel data from `fresh_nodes` that needs to be broadcast to clients due to not exactly matching what
-    /// world generation would return. This is needed to support `preloaded_voxel_data`
-    fresh_voxel_data: Vec<(ChunkId, SerializedVoxelData)>,
 }
 
 impl AccumulatedChanges {
@@ -716,7 +785,6 @@ impl AccumulatedChanges {
             && self.inventory_additions.is_empty()
             && self.inventory_removals.is_empty()
             && self.fresh_nodes.is_empty()
-            && self.fresh_voxel_data.is_empty()
     }
 
     /// Convert state changes for broadcast to clients
@@ -743,7 +811,7 @@ impl AccumulatedChanges {
                 .fresh_nodes
                 .iter()
                 .filter_map(|&id| {
-                    let side = graph.parent(id)?;
+                    let side = graph.primary_parent_side(id)?;
                     Some(FreshNode {
                         side,
                         parent: graph.neighbor(id, side).unwrap(),
@@ -751,7 +819,7 @@ impl AccumulatedChanges {
                 })
                 .collect(),
             block_updates: self.block_updates,
-            voxel_data: self.fresh_voxel_data,
+            voxel_data: Vec::new(),
             inventory_additions: self.inventory_additions,
             inventory_removals: self.inventory_removals,
         })

@@ -1,8 +1,8 @@
 #![allow(clippy::needless_borrowed_reference)]
 
 use rand::{
-    distributions::{Distribution, Standard},
     Rng,
+    distr::{Distribution, StandardUniform},
 };
 
 #[macro_use]
@@ -25,10 +25,9 @@ pub mod lru_slab;
 mod margins;
 pub mod math;
 pub mod node;
-mod plane;
+pub mod peer_traverser;
 pub mod proto;
 mod sim_config;
-pub mod terraingen;
 pub mod traversal;
 pub mod voxel_math;
 pub mod world;
@@ -37,7 +36,6 @@ pub mod worldgen;
 pub use chunks::Chunks;
 pub use graph_entities::GraphEntities;
 pub use lru_slab::LruSlab;
-pub use plane::Plane;
 pub use sim_config::{SimConfig, SimConfigRaw};
 
 // Stable IDs made of 8 random bytes for easy persistent references
@@ -49,9 +47,9 @@ impl std::fmt::Display for EntityId {
     }
 }
 
-impl Distribution<EntityId> for Standard {
+impl Distribution<EntityId> for StandardUniform {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> EntityId {
-        EntityId(rng.gen())
+        EntityId(rng.random())
     }
 }
 

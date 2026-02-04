@@ -23,10 +23,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build Server
-        run: cargo build --package server --release
+        run: cargo build --package server --release --locked
 
       - name: Build Client
-        run: cargo build --package client --release --no-default-features
+        run: cargo build --package client --release --no-default-features --locked
 
       - name: Package Artifacts
         run: |
@@ -43,21 +43,22 @@ jobs:
   package-linux:
     name: Linux
     # Oldest supported runner, for wide glibc compat
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
           lfs: true
       - name: Install dependencies
         run: sudo apt update && sudo apt-get -y install libasound2-dev libvulkan-dev libfontconfig-dev
-      # No prebuilt shaderc, since the official binaries don't to be compatible with Ubuntu 20.04.
+      # No prebuilt shaderc, since the official binaries don't seem to be compatible with Ubuntu 20.04,
+      # and we haven't tested them on Ubuntu 22.04.
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build Server
-        run: cargo build --package server --release
+        run: cargo build --package server --release --locked
 
       - name: Build Client
-        run: cargo build --package client --release --no-default-features
+        run: cargo build --package client --release --no-default-features --locked
 
       - name: Strip
         run: |

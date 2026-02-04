@@ -6,16 +6,16 @@ use std::mem::replace;
 use tracing::warn;
 
 use crate::{
+    SimConfig,
     character_controller::{
-        collision::{check_collision, Collision, CollisionContext},
+        collision::{Collision, CollisionContext, check_collision},
         vector_bounds::{BoundedVectors, VectorBound},
     },
     graph::Graph,
-    math,
+    math::{self, MIsometry},
     proto::{CharacterInput, Position},
     sanitize_motion_input,
     sim_config::CharacterConfig,
-    SimConfig,
 };
 
 /// Runs a single step of character movement
@@ -47,7 +47,7 @@ pub fn run_character_step(
     }
 
     // Renormalize
-    position.local = position.local.renormalize_isometry();
+    position.local = position.local.renormalized();
     let (next_node, transition_xf) = graph.normalize_transform(position.node, &position.local);
     if next_node != position.node {
         position.node = next_node;
@@ -120,7 +120,7 @@ fn run_no_clip_character_step(
 ) {
     *velocity = ctx.movement_input * ctx.cfg.no_clip_movement_speed;
     *on_ground = false;
-    position.local *= math::translate_along(&(*velocity * ctx.dt_seconds));
+    position.local *= MIsometry::translation_along(&(*velocity * ctx.dt_seconds));
 }
 
 /// Returns the normal corresponding to the ground below the character, up to the `allowed_distance`. If
@@ -262,7 +262,9 @@ fn apply_velocity(
     }
 
     if !all_collisions_resolved {
-        warn!("A character entity processed too many collisions and collision resolution was cut short.");
+        warn!(
+            "A character entity processed too many collisions and collision resolution was cut short."
+        );
     }
 
     *velocity = *bounded_vectors.velocity().unwrap();
@@ -280,8 +282,9 @@ fn handle_collision(
     // Collisions are divided into two categories: Ground collisions and wall collisions.
     // Ground collisions will only affect vertical movement of the character, while wall collisions will
     // push the character away from the wall in a perpendicular direction. If the character is on the ground,
-    // we have extra logic: Using a temporary bound to ensure that slanted wall collisions do not lift the
-    // character off the ground.
+    // we have extra logic: Using a temporary bound locking the character to the ground plane to ensure that
+    // slanted wall collisions do not lift the character off the ground (temporary because the ground plane
+    // can change after a ground collision, such as with uneven terrain).
     if is_ground(ctx, &collision.normal) {
         if !*ground_collision_handled {
             // Wall collisions can turn vertical momentum into unwanted horizontal momentum. This can

@@ -1,6 +1,10 @@
-use std::{fs, fs::File, path::PathBuf};
+use std::{
+    fs::{self, File},
+    io::BufReader,
+    path::PathBuf,
+};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use ash::vk;
 use lahar::DedicatedImage;
 use tracing::trace;
@@ -45,7 +49,7 @@ impl Loadable for PngArray {
                 trace!(layer=i, path=%path.display(), "loading");
                 let file =
                     File::open(path).with_context(|| format!("reading {}", path.display()))?;
-                let decoder = png::Decoder::new(file);
+                let decoder = png::Decoder::new(BufReader::new(file));
                 let mut reader = decoder
                     .read_info()
                     .with_context(|| format!("decoding {}", path.display()))?;

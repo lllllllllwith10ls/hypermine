@@ -5,8 +5,8 @@ use tracing::error;
 use crate::{
     collision_math::Ray,
     graph::Graph,
-    graph_collision, math,
-    math::{MIsometry, MVector},
+    graph_collision,
+    math::{MDirection, MIsometry, MPoint},
     proto::Position,
 };
 
@@ -17,7 +17,6 @@ pub fn check_collision(
     relative_displacement: &na::Vector3<f32>,
 ) -> CollisionCheckingResult {
     // Split relative_displacement into its norm and a unit vector
-    let relative_displacement = relative_displacement.to_homogeneous();
     let displacement_sqr = relative_displacement.norm_squared();
     if displacement_sqr < 1e-16 {
         // Fallback for if the displacement vector isn't large enough to reliably be normalized.
@@ -26,11 +25,12 @@ pub fn check_collision(
     }
 
     let displacement_norm = displacement_sqr.sqrt();
-    let displacement_normalized = relative_displacement / displacement_norm;
+    let displacement_normalized =
+        na::UnitVector3::new_unchecked(relative_displacement / displacement_norm);
 
     let ray = Ray::new(
-        MVector::origin(),
-        MVector::<f32>::from(displacement_normalized),
+        MPoint::origin(),
+        MDirection::<f32>::from(displacement_normalized),
     );
     let tanh_distance = displacement_norm.tanh();
 
@@ -56,7 +56,7 @@ pub fn check_collision(
         .atanh();
 
     let displacement_vector = displacement_normalized.xyz() * distance;
-    let displacement_transform = math::translate_along(&displacement_vector);
+    let displacement_transform = MIsometry::translation_along(&displacement_vector);
 
     CollisionCheckingResult {
         displacement_vector,
@@ -67,7 +67,7 @@ pub fn check_collision(
             // This normal now represents a contact point at the origin, so we omit the w-coordinate
             // to ensure that it's orthogonal to the origin.
             normal: na::UnitVector3::new_normalize(
-                (displacement_transform.mtranspose() * hit.normal).xyz(),
+                (displacement_transform.inverse() * hit.normal).xyz(),
             ),
         }),
     }

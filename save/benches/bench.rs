@@ -1,9 +1,9 @@
+use std::hint::black_box;
+
 use save::Save;
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 fn save(c: &mut Criterion) {
     let mut write = c.benchmark_group("write");
@@ -13,7 +13,7 @@ fn save(c: &mut Criterion) {
             voxels: vec![0; 12 * 12 * 12 * 2],
         }],
     };
-    let mut rng = SmallRng::from_entropy();
+    let mut rng = SmallRng::from_os_rng();
     for count in [1, 100, 10000] {
         write.throughput(Throughput::Elements(count));
         write.bench_function(BenchmarkId::from_parameter(count), |b| {
@@ -22,7 +22,7 @@ fn save(c: &mut Criterion) {
                     let file = tempfile::NamedTempFile::new().unwrap();
                     let save = Save::open(file.path(), 12).unwrap();
                     let node_ids = (&mut rng)
-                        .sample_iter(rand::distributions::Standard)
+                        .sample_iter(rand::distr::StandardUniform)
                         .take(count as usize)
                         .collect::<Vec<u128>>();
                     (file, save, node_ids)
@@ -51,7 +51,7 @@ fn save(c: &mut Criterion) {
                     let file = tempfile::NamedTempFile::new().unwrap();
                     let save = Save::open(file.path(), 12).unwrap();
                     let node_ids = (&mut rng)
-                        .sample_iter(rand::distributions::Standard)
+                        .sample_iter(rand::distr::StandardUniform)
                         .take(count as usize)
                         .collect::<Vec<u128>>();
 

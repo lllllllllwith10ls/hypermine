@@ -11,9 +11,10 @@ use crate::lru_slab::SlotId;
 use crate::proto::{BlockUpdate, Position, SerializedVoxelData};
 use crate::voxel_math::{ChunkDirection, CoordAxis, CoordSign, Coords};
 use crate::world::Material;
-use crate::worldgen::NodeState;
-use crate::{margins, Chunks};
+use crate::worldgen::{NodeState, PartialNodeState};
+use crate::{Chunks, margins, peer_traverser};
 
+/// Unique identifier for a single chunk (1/20 of a dodecahedron) in the graph
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId {
     pub node: NodeId,
@@ -27,23 +28,62 @@ impl ChunkId {
 }
 
 impl Graph {
-    pub fn get_chunk_mut(&mut self, chunk: ChunkId) -> Option<&mut Chunk> {
-        Some(&mut self.get_mut(chunk.node).as_mut()?.chunks[chunk.vertex])
+    /// Returns the PartialNodeState for the given node, panicking if it isn't initialized.
+    #[inline]
+    pub fn partial_node_state(&self, node_id: NodeId) -> &PartialNodeState {
+        self[node_id].partial_state.as_ref().unwrap()
     }
 
-    pub fn get_chunk(&self, chunk: ChunkId) -> Option<&Chunk> {
-        Some(&self.get(chunk.node).as_ref()?.chunks[chunk.vertex])
+    /// Initializes the PartialNodeState for the given node if not already initialized,
+    /// initializing other nodes' NodeState and PartialNodeState as necessary
+    pub fn ensure_partial_node_state(&mut self, node_id: NodeId) {
+        if self[node_id].partial_state.is_some() {
+            return;
+        }
+
+        for (_, parent) in self.parents(node_id) {
+            self.ensure_node_state(parent);
+        }
+
+        let partial_node_state = PartialNodeState::new(self, node_id);
+        self[node_id].partial_state = Some(partial_node_state);
+    }
+
+    /// Returns the NodeState for the given node, panicking if it isn't initialized.
+    #[inline]
+    pub fn node_state(&self, node_id: NodeId) -> &NodeState {
+        self[node_id].state.as_ref().unwrap()
+    }
+
+    /// Initializes the NodeState for the given node if not already initialized,
+    /// initializing other nodes' NodeState and PartialNodeState as necessary
+    pub fn ensure_node_state(&mut self, node_id: NodeId) {
+        if self[node_id].state.is_some() {
+            return;
+        }
+
+        self.ensure_partial_node_state(node_id);
+        for peer in peer_traverser::ensure_peer_nodes(self, node_id) {
+            self.ensure_partial_node_state(peer.node());
+        }
+
+        let node_state = NodeState::new(self, node_id);
+        self[node_id].state = Some(node_state);
     }
 
     /// Returns the up-direction relative to the given position, or `None` if the
     /// position is in an unpopulated node.
     pub fn get_relative_up(&self, position: &Position) -> Option<na::UnitVector3<f32>> {
-        let node = self.get(position.node).as_ref()?;
+        let node = &self[position.node];
         Some(na::UnitVector3::new_normalize(
-            (position.local.mtranspose() * node.state.up_direction()).xyz(),
+            (position.local.inverse() * node.state.as_ref()?.up_direction())
+                .as_ref()
+                .xyz(),
         ))
     }
 
+    /// Returns the ID of the chunk neighboring the given chunk on the specified
+    /// cube face side, or `None` if it's on a node the graph hasn't populated.
     pub fn get_chunk_neighbor(
         &self,
         chunk: ChunkId,
@@ -65,6 +105,8 @@ impl Graph {
         }
     }
 
+    /// Returns the block (voxel) neighboring the given block on the specified
+    /// cube face side, or `None` if it's on a node the graph hasn't populated.
     pub fn get_block_neighbor(
         &self,
         mut chunk: ChunkId,
@@ -118,7 +160,7 @@ impl Graph {
         }
 
         // After clearing any margins we needed to clear, we can now insert the data into the graph
-        *self.get_chunk_mut(chunk).unwrap() = Chunk::Populated {
+        self[chunk] = Chunk::Populated {
             voxels,
             surface: None,
             old_surface: None,
@@ -129,7 +171,7 @@ impl Graph {
     pub fn get_material(&self, chunk_id: ChunkId, coords: Coords) -> Option<Material> {
         let dimension = self.layout().dimension;
 
-        let Some(Chunk::Populated { voxels, .. }) = self.get_chunk(chunk_id) else {
+        let Chunk::Populated { voxels, .. } = &self[chunk_id] else {
             return None;
         };
         Some(voxels.get(coords.to_index(dimension)))
@@ -142,11 +184,11 @@ impl Graph {
         let dimension = self.layout().dimension;
 
         // Update the block
-        let Some(Chunk::Populated {
+        let Chunk::Populated {
             voxels,
             surface,
             old_surface,
-        }) = self.get_chunk_mut(block_update.chunk_id)
+        } = &mut self[block_update.chunk_id]
         else {
             return false;
         };
@@ -173,38 +215,80 @@ impl Graph {
 impl Index<ChunkId> for Graph {
     type Output = Chunk;
 
+    #[inline]
     fn index(&self, chunk: ChunkId) -> &Chunk {
-        self.get_chunk(chunk).unwrap()
+        &self[chunk.node].chunks[chunk.vertex]
     }
 }
 
 impl IndexMut<ChunkId> for Graph {
+    #[inline]
     fn index_mut(&mut self, chunk: ChunkId) -> &mut Chunk {
-        self.get_chunk_mut(chunk).unwrap()
+        &mut self[chunk.node].chunks[chunk.vertex]
     }
 }
 
+/// A single dodecahedral node in the graph. All information related to world
+/// generation and the blocks within the node, along with auxiliary information
+/// used for rendering, is stored here.
+#[derive(Default)]
 pub struct Node {
-    pub state: NodeState,
+    pub partial_state: Option<PartialNodeState>,
+    pub state: Option<NodeState>,
     /// We can only populate chunks which lie within a cube of populated nodes, so nodes on the edge
-    /// of the graph always have some `None` chunks.
+    /// of the graph always have some `Fresh` chunks.
     pub chunks: Chunks<Chunk>,
 }
 
+/// Stores the actual voxel data of the chunk, along with metadata used for
+/// rendering. This is an enum type to account for chunks that have not been
+/// fully generated yet.
 #[derive(Default)]
 pub enum Chunk {
+    /// Worldgen has not started running on this chunk yet. This can be for
+    /// multiple reasons:
+    /// - It was just added to the graph and hasn't had time to be processed.
+    /// - All world generation threads are occupied, and it is not this chunk's
+    ///   turn yet.
+    /// - The chunk is not close enough to be worth generating. This might
+    ///   happen for chunks on the far side of a node.
     #[default]
     Fresh,
+
+    /// There is an active thread generating voxels for this chunk, but this
+    /// chunk has not yet received the results from this thread.
     Generating,
+
+    /// This chunk's voxels are fully generated and ready for use.
     Populated {
+        /// The voxels present in the chunk
         voxels: VoxelData,
+
+        /// A reference to the "mesh" used to render the chunk. Set to `None` if
+        /// this mesh needs to be computed or recomputed.
         surface: Option<SlotId>,
+
+        /// An outdated (but valid) reference to the "mesh" used to render the
+        /// chunk. This is used to allow the mesh to still be rendered while it
+        /// is being recomputed.
         old_surface: Option<SlotId>,
     },
 }
 
+/// The voxels present in a particular chunk, along a margin.
+///
+/// The margin consists of voxels of adjacent chunks, which is a necessary extra
+/// piece of data needed to properly compute the rendered surface of the chunk.
 pub enum VoxelData {
+    /// All voxels, including the margin, are the same material. This data type
+    /// is used to save storage space and processing, since such chunks do not
+    /// need to be rendered at all.
+    // TODO: This abstraction needs some work, as it doesn't account for areas
+    // underground with a mixed set of materials, such as dirt and stone.
     Solid(Material),
+
+    /// This chunk (or its margins) may consist of multiple materials, which are
+    /// represented in the given boxed slice.
     Dense(Box<[Material]>),
 }
 
@@ -328,32 +412,9 @@ impl ChunkLayout {
 
     /// Takes in a single grid coordinate and returns a range containing all voxel coordinates surrounding it.
     #[inline]
-    pub fn neighboring_voxels(&self, grid_coord: u8) -> impl Iterator<Item = u8> {
+    pub fn neighboring_voxels(&self, grid_coord: u8) -> impl Iterator<Item = u8> + use<> {
         grid_coord.saturating_sub(1)..grid_coord.saturating_add(1).min(self.dimension())
     }
-}
-
-/// Ensures that every new node of the given Graph is populated with a [Node] and is
-/// ready for world generation.
-pub fn populate_fresh_nodes(graph: &mut Graph) {
-    let fresh = graph.fresh().to_vec();
-    graph.clear_fresh();
-    for &node in &fresh {
-        populate_node(graph, node);
-    }
-}
-
-fn populate_node(graph: &mut Graph, node: NodeId) {
-    *graph.get_mut(node) = Some(Node {
-        state: graph
-            .parent(node)
-            .and_then(|i| {
-                let parent_state = &graph.get(graph.neighbor(node, i)?).as_ref()?.state;
-                Some(parent_state.child(graph, node, i))
-            })
-            .unwrap_or_else(NodeState::root),
-        chunks: Chunks::default(),
-    });
 }
 
 /// Represents a discretized region in the voxel grid contained by an axis-aligned bounding box.
@@ -407,7 +468,7 @@ impl VoxelAABB {
         axis0: usize,
         axis1: usize,
         axis2: usize,
-    ) -> impl Iterator<Item = (u8, u8, u8)> {
+    ) -> impl Iterator<Item = (u8, u8, u8)> + use<> {
         let bounds = self.bounds;
         (bounds[axis0][0]..bounds[axis0][1]).flat_map(move |i| {
             (bounds[axis1][0]..bounds[axis1][1])
@@ -416,14 +477,14 @@ impl VoxelAABB {
     }
 
     /// Iterator over grid lines intersecting the region, represented as ordered pairs determining the line's two fixed coordinates
-    pub fn grid_lines(&self, axis0: usize, axis1: usize) -> impl Iterator<Item = (u8, u8)> {
+    pub fn grid_lines(&self, axis0: usize, axis1: usize) -> impl Iterator<Item = (u8, u8)> + use<> {
         let bounds = self.bounds;
         (bounds[axis0][0]..bounds[axis0][1])
             .flat_map(move |i| (bounds[axis1][0]..bounds[axis1][1]).map(move |j| (i, j)))
     }
 
     /// Iterator over grid planes intersecting the region, represented as integers determining the plane's fixed coordinate
-    pub fn grid_planes(&self, axis: usize) -> impl Iterator<Item = u8> {
+    pub fn grid_planes(&self, axis: usize) -> impl Iterator<Item = u8> + use<> {
         self.bounds[axis][0]..self.bounds[axis][1]
     }
 }
@@ -432,8 +493,7 @@ impl VoxelAABB {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::math;
-    use crate::math::{MIsometry, MVector};
+    use crate::math::{MDirection, MIsometry, MPoint, MVector};
 
     use super::*;
 
@@ -446,11 +506,9 @@ mod tests {
         let layout = ChunkLayout::new(dimension);
 
         // Pick an arbitrary ray by transforming the positive-x-axis ray.
-        let ray = MIsometry::rotation_to_homogeneous(na::Rotation3::from_axis_angle(
-            &na::Vector3::z_axis(),
-            0.4,
-        )) * math::translate_along(&na::Vector3::new(0.2, 0.3, 0.1))
-            * &Ray::new(MVector::w(), MVector::x());
+        let ray = MIsometry::from(na::Rotation3::from_axis_angle(&na::Vector3::z_axis(), 0.4))
+            * MIsometry::translation_along(&na::Vector3::new(0.2, 0.3, 0.1))
+            * &Ray::new(MPoint::w(), MDirection::x());
 
         let tanh_distance = 0.2;
         let radius = 0.1;
@@ -462,7 +520,7 @@ mod tests {
         let ray_test_points: Vec<_> = (0..num_ray_test_points)
             .map(|i| {
                 ray.ray_point(tanh_distance * (i as f32 / (num_ray_test_points - 1) as f32))
-                    .lorentz_normalize()
+                    .normalized_point()
             })
             .collect();
 
@@ -485,7 +543,7 @@ mod tests {
                 let mut plane_normal = MVector::zero();
                 plane_normal[t_axis] = 1.0;
                 plane_normal[3] = layout.grid_to_dual(t);
-                let plane_normal = plane_normal.lorentz_normalize();
+                let plane_normal = plane_normal.normalized_direction();
 
                 for test_point in &ray_test_points {
                     assert!(
@@ -519,7 +577,7 @@ mod tests {
                     line_position[u_axis] = layout.grid_to_dual(u);
                     line_position[v_axis] = layout.grid_to_dual(v);
                     line_position[3] = 1.0;
-                    let line_position = line_position.lorentz_normalize();
+                    let line_position = line_position.normalized_point();
 
                     for test_point in &ray_test_points {
                         assert!(
@@ -551,7 +609,7 @@ mod tests {
                         layout.grid_to_dual(z),
                         1.0,
                     )
-                    .lorentz_normalize();
+                    .normalized_point();
 
                     for test_point in &ray_test_points {
                         assert!(

@@ -56,7 +56,7 @@ pub fn sphere_cast(
             Some(GraphCastHit {
                 tanh_distance: hit.tanh_distance,
                 chunk,
-                normal: transform.mtranspose() * hit.normal,
+                normal: transform.inverse() * hit.normal,
             })
         });
     }
@@ -88,8 +88,8 @@ mod tests {
         collision_math::Ray,
         dodeca::{self, Side, Vertex},
         graph::{Graph, NodeId},
-        math::MIsometry,
-        node::{populate_fresh_nodes, VoxelData},
+        math::{MIsometry, MPoint},
+        node::VoxelData,
         proto::Position,
         traversal::{ensure_nearby, nearby_nodes},
         voxel_math::Coords,
@@ -152,7 +152,6 @@ mod tests {
 
             // Set up a graph with void chunks
             ensure_nearby(&mut graph, &Position::origin(), graph_radius);
-            populate_fresh_nodes(&mut graph);
             for (node, _) in nearby_nodes(&graph, &Position::origin(), graph_radius) {
                 for vertex in dodeca::Vertex::iter() {
                     graph[ChunkId::new(node, vertex)] = Chunk::Populated {
@@ -175,9 +174,9 @@ mod tests {
                 .node_path
                 .iter()
                 .fold(MIsometry::identity(), |transform: MIsometry<f32>, side| {
-                    transform * *side.reflection()
+                    transform * side.reflection()
                 })
-                * *self.chosen_voxel.vertex.dual_to_node();
+                * self.chosen_voxel.vertex.dual_to_node();
 
             let dual_to_grid_factor = graph.layout().dual_to_grid_factor();
             let ray_target = chosen_chunk_transform
@@ -187,7 +186,7 @@ mod tests {
                     self.chosen_chunk_relative_grid_ray_end[2] / dual_to_grid_factor,
                     1.0,
                 )
-                .lorentz_normalize();
+                .normalized_point();
 
             let ray_position = *Vertex::A.dual_to_node()
                 * MVector::new(
@@ -196,13 +195,13 @@ mod tests {
                     self.start_chunk_relative_grid_ray_start[2] / dual_to_grid_factor,
                     1.0,
                 )
-                .lorentz_normalize();
-            let ray_direction = ray_target - ray_position;
+                .normalized_point();
+            let ray_direction = ray_target.as_ref() - ray_position.as_ref();
 
             let ray = Ray::new(
                 ray_position,
-                (ray_direction + ray_position * ray_position.mip(&ray_direction))
-                    .lorentz_normalize(),
+                (ray_direction.as_ref() + ray_position.as_ref() * ray_position.mip(&ray_direction))
+                    .normalized_direction(),
             );
 
             let tanh_distance =
@@ -246,7 +245,7 @@ mod tests {
             );
             let Chunk::Populated {
                 voxels: voxel_data, ..
-            } = graph.get_chunk_mut(chunk).unwrap()
+            } = &mut graph[chunk]
             else {
                 panic!("All chunks should be populated.");
             };
@@ -420,7 +419,6 @@ mod tests {
         ];
 
         // Populate all graph nodes
-        populate_fresh_nodes(&mut graph);
         for node in [
             &[NodeId::ROOT],
             first_neighbors.as_slice(),
@@ -438,13 +436,13 @@ mod tests {
         }
 
         // The node coordinates of the corner of the missing node
-        let vertex_pos = *Vertex::A.dual_to_node() * MVector::origin();
+        let vertex_pos = Vertex::A.dual_to_node() * MPoint::origin();
 
         // Use a ray starting from the origin. The direction vector is vertex_pos with the w coordinate
         // set to 0 and normalized
         let ray = Ray::new(
-            MVector::origin(),
-            (vertex_pos - MVector::w() * vertex_pos.w).normalize(),
+            MPoint::origin(),
+            (vertex_pos.as_ref() - MVector::w() * vertex_pos.w).normalized_direction(),
         );
         let sphere_radius = 0.1;
 

@@ -1,16 +1,21 @@
-use rand::{distributions::Uniform, Rng, SeedableRng};
+use horosphere::{HorosphereChunk, HorosphereNode};
+use plane::Plane;
+use rand::{Rng, SeedableRng, distr::Uniform};
 use rand_distr::Normal;
+use terraingen::VoronoiInfo;
 
 use crate::{
     dodeca::{Side, Vertex},
     graph::{Graph, NodeId},
-    margins, math,
-    math::MVector,
+    margins,
+    math::{self, MVector},
     node::{ChunkId, VoxelData},
-    terraingen::VoronoiInfo,
     world::Material,
-    Plane,
 };
+
+mod horosphere;
+mod plane;
+mod terraingen;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum NodeStateKind {
@@ -62,67 +67,101 @@ impl NodeStateRoad {
     }
 }
 
+/// Contains a minimal amount of information about a node that can be deduced entirely from
+/// the NodeState of its parents.
+pub struct PartialNodeState {
+    /// This becomes a real horosphere only if it doesn't interfere with another higher-priority horosphere.
+    /// See `HorosphereNode::has_priority` for the definition of priority.
+    candidate_horosphere: Option<HorosphereNode>,
+}
+
+impl PartialNodeState {
+    pub fn new(graph: &Graph, node: NodeId) -> Self {
+        Self {
+            candidate_horosphere: HorosphereNode::new(graph, node),
+        }
+    }
+}
+
+/// Contains all information about a node used for world generation. Most world
+/// generation logic uses this information as a starting point. The `NodeState` is deduced
+/// from the `NodeState` of the node's parents, along with the `PartialNodeState` of the node
+/// itself and its "peer" nodes (See `peer_traverser`).
 pub struct NodeState {
     kind: NodeStateKind,
-    surface: Plane<f64>,
+    surface: Plane,
     road_state: NodeStateRoad,
     enviro: EnviroFactors,
+    horosphere: Option<HorosphereNode>,
 }
 impl NodeState {
-    pub fn root() -> Self {
-        Self {
-            kind: NodeStateKind::ROOT,
-            surface: Plane::from(Side::A),
-            road_state: NodeStateRoad::ROOT,
-            enviro: EnviroFactors {
+    pub fn new(graph: &Graph, node: NodeId) -> Self {
+        let mut parents = graph
+            .parents(node)
+            .map(|(s, n)| ParentInfo {
+                node_id: n,
+                side: s,
+                node_state: graph.node_state(n),
+            })
+            .fuse();
+        let parents = [parents.next(), parents.next(), parents.next()];
+
+        let enviro = match (parents[0], parents[1]) {
+            (None, None) => EnviroFactors {
                 max_elevation: 0.0,
                 temperature: 0.0,
                 rainfall: 0.0,
                 blockiness: 0.0,
             },
-        }
-    }
-
-    pub fn child(&self, graph: &Graph, node: NodeId, side: Side) -> Self {
-        let mut d = graph
-            .descenders(node)
-            .map(|(s, n)| (s, &graph.get(n).as_ref().unwrap().state));
-        let enviro = match (d.next(), d.next()) {
-            (Some(_), None) => {
-                let parent_side = graph.parent(node).unwrap();
-                let parent_node = graph.neighbor(node, parent_side).unwrap();
-                let parent_state = &graph.get(parent_node).as_ref().unwrap().state;
+            (Some(parent), None) => {
                 let spice = graph.hash_of(node) as u64;
-                EnviroFactors::varied_from(parent_state.enviro, spice)
+                EnviroFactors::varied_from(parent.node_state.enviro, spice)
             }
-            (Some((a_side, a_state)), Some((b_side, b_state))) => {
-                let ab_node = graph
-                    .neighbor(graph.neighbor(node, a_side).unwrap(), b_side)
-                    .unwrap();
-                let ab_state = &graph.get(ab_node).as_ref().unwrap().state;
-                EnviroFactors::continue_from(a_state.enviro, b_state.enviro, ab_state.enviro)
+            (Some(parent_a), Some(parent_b)) => {
+                let ab_node = graph.neighbor(parent_a.node_id, parent_b.side).unwrap();
+                let ab_state = &graph.node_state(ab_node);
+                EnviroFactors::continue_from(
+                    parent_a.node_state.enviro,
+                    parent_b.node_state.enviro,
+                    ab_state.enviro,
+                )
             }
             _ => unreachable!(),
         };
 
-        let child_kind = self.kind.child(side);
-        let child_road = self.road_state.child(side);
+        let kind = parents[0].map_or(NodeStateKind::ROOT, |p| p.node_state.kind.child(p.side));
+        let road_state = parents[0].map_or(NodeStateRoad::ROOT, |p| {
+            p.node_state.road_state.child(p.side)
+        });
+
+        let horosphere = graph
+            .partial_node_state(node)
+            .candidate_horosphere
+            .filter(|h| h.should_generate(graph, node));
 
         Self {
-            kind: child_kind,
-            surface: match child_kind {
+            kind,
+            surface: match kind {
                 Land => Plane::from(Side::A),
                 Sky => -Plane::from(Side::A),
-                _ => side * self.surface,
+                _ => parents[0].map(|p| p.side * p.node_state.surface).unwrap(),
             },
-            road_state: child_road,
+            road_state,
             enviro,
+            horosphere,
         }
     }
 
     pub fn up_direction(&self) -> MVector<f32> {
-        self.surface.normal().to_f32()
+        *self.surface.scaled_normal()
     }
+}
+
+#[derive(Clone, Copy)]
+struct ParentInfo<'a> {
+    node_id: NodeId,
+    side: Side,
+    node_state: &'a NodeState,
 }
 
 struct VoxelCoords {
@@ -169,32 +208,38 @@ pub struct ChunkParams {
     /// Random quantities stored at the eight adjacent nodes, used for terrain generation
     env: ChunkIncidentEnviroFactors,
     /// Reference plane for the terrain surface
-    surface: Plane<f64>,
+    surface: Plane,
     /// Whether this chunk contains a segment of the road
     is_road: bool,
     /// Whether this chunk contains a section of the road's supports
     is_road_support: bool,
     /// Random quantity used to seed terrain gen
     node_spice: u64,
+    /// Horosphere to place in the chunk
+    horosphere: Option<HorosphereChunk>,
 }
 
 impl ChunkParams {
-    /// Extract data necessary to generate a chunk
-    ///
-    /// Returns `None` if an unpopulated node is needed.
-    pub fn new(dimension: u8, graph: &Graph, chunk: ChunkId) -> Option<Self> {
-        let state = &graph.get(chunk.node).as_ref()?.state;
-        Some(Self {
-            dimension,
+    /// Extract data necessary to generate a chunk, generating new graph nodes if necessary
+    pub fn new(graph: &mut Graph, chunk: ChunkId) -> Self {
+        graph.ensure_node_state(chunk.node);
+        let env = chunk_incident_enviro_factors(graph, chunk);
+        let state = graph.node_state(chunk.node);
+        Self {
+            dimension: graph.layout().dimension(),
             chunk: chunk.vertex,
-            env: chunk_incident_enviro_factors(graph, chunk)?,
+            env,
             surface: state.surface,
             is_road: state.kind == Sky
                 && ((state.road_state == East) || (state.road_state == West)),
             is_road_support: ((state.kind == Land) || (state.kind == DeepLand))
                 && ((state.road_state == East) || (state.road_state == West)),
             node_spice: graph.hash_of(chunk.node) as u64,
-        })
+            horosphere: state
+                .horosphere
+                .as_ref()
+                .map(|h| HorosphereChunk::new(h, chunk.vertex)),
+        }
     }
 
     pub fn chunk(&self) -> Vertex {
@@ -203,33 +248,6 @@ impl ChunkParams {
 
     /// Generate voxels making up the chunk
     pub fn generate_voxels(&self) -> VoxelData {
-        // Determine whether this chunk might contain a boundary between solid and void
-        let mut me_min = self.env.max_elevations[0];
-        let mut me_max = self.env.max_elevations[0];
-        for &me in &self.env.max_elevations[1..] {
-            me_min = me_min.min(me);
-            me_max = me_max.max(me);
-        }
-        // Maximum difference between elevations at the center of a chunk and any other point in the chunk
-        // TODO: Compute what this actually is, current value is a guess! Real one must be > 0.6
-        // empirically.
-        const ELEVATION_MARGIN: f64 = 0.7;
-        let center_elevation = self
-            .surface
-            .distance_to_chunk(self.chunk, &na::Vector3::repeat(0.5));
-        if (center_elevation - ELEVATION_MARGIN > me_max / TERRAIN_SMOOTHNESS)
-            && !(self.is_road || self.is_road_support)
-        {
-            // The whole chunk is above ground and not part of the road
-            return VoxelData::Solid(Material::Void);
-        }
-
-        if (center_elevation + ELEVATION_MARGIN < me_min / TERRAIN_SMOOTHNESS) && !self.is_road {
-            // The whole chunk is underground
-            // TODO: More accurate VoxelData
-            return VoxelData::Solid(Material::Dirt);
-        }
-
         let mut voxels = VoxelData::Solid(Material::Void);
         let mut rng = rand_pcg::Pcg64Mcg::seed_from_u64(hash(self.node_spice, self.chunk as u64));
 
@@ -241,11 +259,13 @@ impl ChunkParams {
             self.generate_road_support(&mut voxels);
         }
 
+        if let Some(horosphere) = &self.horosphere {
+            horosphere.generate(&mut voxels, self.dimension);
+        }
+
         // TODO: Don't generate detailed data for solid chunks with no neighboring voids
 
-        if self.dimension > 4 && matches!(voxels, VoxelData::Dense(_)) {
-            self.generate_trees(&mut voxels, &mut rng);
-        }
+        self.generate_trees(&mut voxels, &mut rng);
 
         margins::initialize_margins(self.dimension, &mut voxels);
         voxels
@@ -254,6 +274,33 @@ impl ChunkParams {
     /// Performs all terrain generation that can be done one voxel at a time and with
     /// only the containing chunk's surrounding nodes' envirofactors.
     fn generate_terrain(&self, voxels: &mut VoxelData, rng: &mut Pcg64Mcg) {
+        // Determine whether this chunk might contain a boundary between solid and void
+        let mut me_min = self.env.max_elevations[0];
+        let mut me_max = self.env.max_elevations[0];
+        for &me in &self.env.max_elevations[1..] {
+            me_min = me_min.min(me);
+            me_max = me_max.max(me);
+        }
+        // Maximum difference between elevations at the center of a chunk and any other point in the chunk
+        // TODO: Compute what this actually is, current value is a guess! Real one must be > 0.6
+        // empirically.
+        const ELEVATION_MARGIN: f32 = 0.7;
+        let center_elevation = self
+            .surface
+            .distance_to_chunk(self.chunk, &na::Vector3::repeat(0.5));
+        if center_elevation - ELEVATION_MARGIN > me_max / TERRAIN_SMOOTHNESS {
+            // The whole chunk is above ground
+            *voxels = VoxelData::Solid(Material::Void);
+            return;
+        }
+        if center_elevation + ELEVATION_MARGIN < me_min / TERRAIN_SMOOTHNESS {
+            // The whole chunk is underground
+            *voxels = VoxelData::Solid(Material::Dirt);
+            return;
+        }
+
+        // Otherwise, the chunk might contain a solid/void boundary, so the full terrain generation
+        // code should run.
         let normal = Normal::new(0.0, 0.03).unwrap();
 
         for (x, y, z) in VoxelCoords::new(self.dimension) {
@@ -337,6 +384,12 @@ impl ChunkParams {
 
     /// Fills the half-plane below the road with wooden supports.
     fn generate_road_support(&self, voxels: &mut VoxelData) {
+        if voxels.is_solid() && voxels.get(0) != Material::Void {
+            // There is guaranteed no void to fill with the road supports, so
+            // nothing to do here.
+            return;
+        }
+
         let plane = -Plane::from(Side::B);
 
         for (x, y, z) in VoxelCoords::new(self.dimension) {
@@ -386,14 +439,24 @@ impl ChunkParams {
     /// and a block of leaves. The leaf block is on the opposite face of the
     /// wood block as the ground block.
     fn generate_trees(&self, voxels: &mut VoxelData, rng: &mut Pcg64Mcg) {
+        if voxels.is_solid() {
+            // No trees can be generated unless there's both land and air.
+            return;
+        }
+
+        if self.dimension <= 4 {
+            // The tree generation algorithm can crash when the chunk size is too small.
+            return;
+        }
+
         // margins are added to keep voxels outside the chunk from being read/written
-        let random_position = Uniform::new(1, self.dimension - 1);
+        let random_position = Uniform::new(1, self.dimension - 1).unwrap();
 
         let rain = self.env.rainfalls[0];
         let tree_candidate_count =
-            (u32::from(self.dimension - 2).pow(3) as f64 * (rain / 100.0).clamp(0.0, 0.5)) as usize;
+            (u32::from(self.dimension - 2).pow(3) as f32 * (rain / 100.0).clamp(0.0, 0.5)) as usize;
         for _ in 0..tree_candidate_count {
-            let loc = na::Vector3::from_distribution(&random_position, rng);
+            let loc = na::Vector3::from_fn(|_, _| rng.sample(random_position));
             let voxel_of_interest_index = index(self.dimension, loc);
             let neighbor_data = self.voxel_neighbors(loc, voxels);
 
@@ -460,7 +523,7 @@ impl ChunkParams {
     }
 }
 
-const TERRAIN_SMOOTHNESS: f64 = 10.0;
+const TERRAIN_SMOOTHNESS: f32 = 10.0;
 
 struct NeighborData {
     coords_opposing: na::Vector3<u8>,
@@ -469,15 +532,15 @@ struct NeighborData {
 
 #[derive(Copy, Clone)]
 struct EnviroFactors {
-    max_elevation: f64,
-    temperature: f64,
-    rainfall: f64,
-    blockiness: f64,
+    max_elevation: f32,
+    temperature: f32,
+    rainfall: f32,
+    blockiness: f32,
 }
 impl EnviroFactors {
     fn varied_from(parent: Self, spice: u64) -> Self {
         let mut rng = rand_pcg::Pcg64Mcg::seed_from_u64(spice);
-        let unif = Uniform::new_inclusive(-1.0, 1.0);
+        let unif = Uniform::new_inclusive(-1.0, 1.0).unwrap();
         let max_elevation = parent.max_elevation + rng.sample(Normal::new(0.0, 4.0).unwrap());
 
         Self {
@@ -496,7 +559,7 @@ impl EnviroFactors {
         }
     }
 }
-impl From<EnviroFactors> for (f64, f64, f64, f64) {
+impl From<EnviroFactors> for (f32, f32, f32, f32) {
     fn from(envirofactors: EnviroFactors) -> Self {
         (
             envirofactors.max_elevation,
@@ -507,43 +570,40 @@ impl From<EnviroFactors> for (f64, f64, f64, f64) {
     }
 }
 struct ChunkIncidentEnviroFactors {
-    max_elevations: [f64; 8],
-    temperatures: [f64; 8],
-    rainfalls: [f64; 8],
-    blockinesses: [f64; 8],
+    max_elevations: [f32; 8],
+    temperatures: [f32; 8],
+    rainfalls: [f32; 8],
+    blockinesses: [f32; 8],
 }
 
 /// Returns the max_elevation values for the nodes that are incident to this chunk,
-/// sorted and converted to f64 for use in functions like trilerp.
+/// sorted and converted to f32 for use in functions like trilerp.
 ///
 /// Returns `None` if not all incident nodes are populated.
-fn chunk_incident_enviro_factors(
-    graph: &Graph,
-    chunk: ChunkId,
-) -> Option<ChunkIncidentEnviroFactors> {
-    let mut i = chunk
-        .vertex
-        .dual_vertices()
-        .map(|(_, mut path)| path.try_fold(chunk.node, |node, side| graph.neighbor(node, side)))
-        .filter_map(|node| Some(graph.get(node?).as_ref()?.state.enviro));
+fn chunk_incident_enviro_factors(graph: &mut Graph, chunk: ChunkId) -> ChunkIncidentEnviroFactors {
+    let mut i = chunk.vertex.dual_vertices().map(|(_, path)| {
+        let node = path.fold(chunk.node, |node, side| graph.ensure_neighbor(node, side));
+        graph.ensure_node_state(node);
+        graph.node_state(node).enviro
+    });
 
     // this is a bit cursed, but I don't want to collect into a vec because perf,
     // and I can't just return an iterator because then something still references graph.
-    let (e1, t1, r1, b1) = i.next()?.into();
-    let (e2, t2, r2, b2) = i.next()?.into();
-    let (e3, t3, r3, b3) = i.next()?.into();
-    let (e4, t4, r4, b4) = i.next()?.into();
-    let (e5, t5, r5, b5) = i.next()?.into();
-    let (e6, t6, r6, b6) = i.next()?.into();
-    let (e7, t7, r7, b7) = i.next()?.into();
-    let (e8, t8, r8, b8) = i.next()?.into();
+    let (e1, t1, r1, b1) = i.next().unwrap().into();
+    let (e2, t2, r2, b2) = i.next().unwrap().into();
+    let (e3, t3, r3, b3) = i.next().unwrap().into();
+    let (e4, t4, r4, b4) = i.next().unwrap().into();
+    let (e5, t5, r5, b5) = i.next().unwrap().into();
+    let (e6, t6, r6, b6) = i.next().unwrap().into();
+    let (e7, t7, r7, b7) = i.next().unwrap().into();
+    let (e8, t8, r8, b8) = i.next().unwrap().into();
 
-    Some(ChunkIncidentEnviroFactors {
+    ChunkIncidentEnviroFactors {
         max_elevations: [e1, e2, e3, e4, e5, e6, e7, e8],
         temperatures: [t1, t2, t3, t4, t5, t6, t7, t8],
         rainfalls: [r1, r2, r3, r4, r5, r6, r7, r8],
         blockinesses: [b1, b2, b3, b4, b5, b6, b7, b8],
-    })
+    }
 }
 
 /// Linearly interpolate at interior and boundary of a cube given values at the eight corners.
@@ -585,16 +645,16 @@ fn serp<N: na::RealField + Copy>(v0: N, v1: N, t: N, threshold: N) -> N {
 /// scale controls wavelength and amplitude. It is not 1:1 to the number of blocks in a period.
 /// strength represents extremity of terracing effect. Sensible values are in (0, 0.5).
 /// The greater the value of limiter, the stronger the bias of threshold towards 0.
-fn terracing_diff(elev_raw: f64, block: f64, scale: f64, strength: f64, limiter: f64) -> f64 {
-    let threshold: f64 = strength / (1.0 + libm::pow(2.0, limiter - block));
-    let elev_floor = libm::floor(elev_raw / scale);
+fn terracing_diff(elev_raw: f32, block: f32, scale: f32, strength: f32, limiter: f32) -> f32 {
+    let threshold: f32 = strength / (1.0 + libm::powf(2.0, limiter - block));
+    let elev_floor = libm::floorf(elev_raw / scale);
     let elev_rem = elev_raw / scale - elev_floor;
     scale * elev_floor + serp(0.0, scale, elev_rem, threshold) - elev_raw
 }
 
 /// Location of the center of a voxel in a unit chunk
-fn voxel_center(dimension: u8, voxel: na::Vector3<u8>) -> na::Vector3<f64> {
-    voxel.map(|x| f64::from(x) + 0.5) / f64::from(dimension)
+fn voxel_center(dimension: u8, voxel: na::Vector3<u8>) -> na::Vector3<f32> {
+    voxel.map(|x| f32::from(x) + 0.5) / f32::from(dimension)
 }
 
 fn index(dimension: u8, v: na::Vector3<u8>) -> usize {
@@ -615,8 +675,6 @@ fn hash(a: u64, b: u64) -> u64 {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::node::Node;
-    use crate::Chunks;
     use approx::*;
 
     const CHUNK_SIZE: u8 = 12;
@@ -683,21 +741,14 @@ mod test {
             let new_node = path.fold(NodeId::ROOT, |node, side| g.ensure_neighbor(node, side));
 
             // assigning state
-            *g.get_mut(new_node) = Some(Node {
-                state: {
-                    let mut state = NodeState::root();
-                    state.enviro.max_elevation = i as f64 + 1.0;
-                    state
-                },
-                chunks: Chunks::default(),
-            });
+            g.ensure_node_state(new_node);
+            g[new_node].state.as_mut().unwrap().enviro.max_elevation = i as f32 + 1.0;
         }
 
-        let enviros =
-            chunk_incident_enviro_factors(&g, ChunkId::new(NodeId::ROOT, Vertex::A)).unwrap();
+        let enviros = chunk_incident_enviro_factors(&mut g, ChunkId::new(NodeId::ROOT, Vertex::A));
         for (i, max_elevation) in enviros.max_elevations.into_iter().enumerate() {
             println!("{i}, {max_elevation}");
-            assert_abs_diff_eq!(max_elevation, (i + 1) as f64, epsilon = 1e-8);
+            assert_abs_diff_eq!(max_elevation, (i + 1) as f32, epsilon = 1e-8);
         }
 
         // see corresponding test for trilerp
@@ -712,7 +763,7 @@ mod test {
                     let a = na::Vector3::new(x, y, z);
                     if a == center {
                         checked_center = true;
-                        let c = center.map(|x| x as f64) / CHUNK_SIZE as f64;
+                        let c = center.map(|x| x as f32) / CHUNK_SIZE as f32;
                         let center_max_elevation = trilerp(&enviros.max_elevations, c);
                         assert_abs_diff_eq!(center_max_elevation, 4.5, epsilon = 1e-8);
                         break 'top;

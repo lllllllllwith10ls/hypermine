@@ -2,7 +2,7 @@
 name = "server"
 version = "0.1.0"
 authors = ["Benjamin Saunders <ben.e.saunders@gmail.com>"]
-edition = "2021"
+edition = "2024"
 publish = false
 license = "Apache-2.0 OR Zlib"
 
@@ -17,10 +17,10 @@ quinn = { workspace = true }
 serde = { version = "1.0.104", features = ["derive", "rc"] }
 toml = { workspace = true }
 anyhow = "1.0.26"
-rcgen = { version = "0.13.1", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14.6", default-features = false, features = ["ring"] }
 hostname = "0.4.0"
 hecs = { workspace = true }
-rand = { version = "0.8.5", features = ["small_rng"] }
+rand = { version = "0.9.0", features = ["small_rng"] }
 fxhash = "0.2.1"
 nalgebra = { workspace = true }
 libm = "0.2.6"
