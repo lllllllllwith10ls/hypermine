@@ -1,19 +1,16 @@
 use horosphere::{HorosphereChunk, HorosphereNode};
+use gravity_mirror::{GravityMirrorNode};
 use plane::Plane;
 use rand::{Rng, SeedableRng, distr::Uniform};
 use rand_distr::Normal;
 use terraingen::VoronoiInfo;
 
 use crate::{
-    dodeca::{Side, Vertex},
-    graph::{Graph, NodeId},
-    margins,
-    math::{self, MVector},
-    node::{ChunkId, VoxelData},
-    world::Material,
+    dodeca::{Side, Vertex}, graph::{Graph, NodeId}, margins, math::{self, MIsometry, MPoint, MVector}, node::{ChunkId, VoxelData}, proto::Position, world::Material
 };
 
 mod horosphere;
+mod gravity_mirror;
 mod plane;
 mod terraingen;
 
@@ -34,8 +31,8 @@ impl NodeStateKind {
         match (self, side) {
             (Sky, Side::A) => Land,
             (Land, Side::A) => Sky,
-            (Sky, _) if !side.adjacent_to(Side::A) => Sky,
-            (Land, _) if !side.adjacent_to(Side::A) => Land,
+            (Sky, _) if !side.adjacent_to(Side::A) => DeepSky,
+            (Land, _) if !side.adjacent_to(Side::A) => DeepLand,
             _ => self,
         }
     }
@@ -73,12 +70,14 @@ pub struct PartialNodeState {
     /// This becomes a real horosphere only if it doesn't interfere with another higher-priority horosphere.
     /// See `HorosphereNode::has_priority` for the definition of priority.
     candidate_horosphere: Option<HorosphereNode>,
+    candidate_gravity_mirror: Option<GravityMirrorNode>,
 }
 
 impl PartialNodeState {
     pub fn new(graph: &Graph, node: NodeId) -> Self {
         Self {
             candidate_horosphere: HorosphereNode::new(graph, node),
+            candidate_gravity_mirror: GravityMirrorNode::new(graph, node),
         }
     }
 }
@@ -93,6 +92,7 @@ pub struct NodeState {
     road_state: NodeStateRoad,
     enviro: EnviroFactors,
     horosphere: Option<HorosphereNode>,
+    gravity_mirror: Option<GravityMirrorNode>,
 }
 impl NodeState {
     pub fn new(graph: &Graph, node: NodeId) -> Self {
@@ -138,22 +138,66 @@ impl NodeState {
             .partial_node_state(node)
             .candidate_horosphere
             .filter(|h| h.should_generate(graph, node));
+        
+        let gravity_mirror = graph
+            .partial_node_state(node)
+            .candidate_gravity_mirror
+            .filter(|g| g.should_generate(graph, node));
+
+        let mut surface = match kind {
+            Land => Plane::from(Side::A),
+            Sky => -Plane::from(Side::A),
+            _ => parents[0].map(|p| p.side * p.node_state.surface).unwrap(),
+        };
+        
+        if parents[0].is_some() && parents[0].unwrap().node_state.gravity_mirror.is_some() {
+            surface = parents[0].map(|p| p.side * p.node_state.surface).unwrap();
+            let parent_mirror = *parents[0].unwrap().node_state.gravity_mirror.unwrap().mirror();
+            let mirror = parents[0].unwrap().side * parent_mirror;
+            if mirror.distance_to(&MPoint::origin()).signum() !=
+            parent_mirror.distance_to(&MPoint::origin()).signum() {
+                surface = &MIsometry::reflection(&mirror.scaled_normal().normalized_direction()) * surface;
+            }
+        } else if parents[0].is_some() && gravity_mirror.is_some() {
+            surface = parents[0].map(|p| p.side * p.node_state.surface).unwrap();
+            let mirror = *gravity_mirror.unwrap().mirror();
+            let parent_mirror = parents[0].unwrap().side * mirror;
+            if mirror.distance_to(&MPoint::origin()).signum() !=
+            parent_mirror.distance_to(&MPoint::origin()).signum() {
+                surface = &MIsometry::reflection(&mirror.scaled_normal().normalized_direction()) * surface;
+            }
+        }
 
         Self {
             kind,
-            surface: match kind {
-                Land => Plane::from(Side::A),
-                Sky => -Plane::from(Side::A),
-                _ => parents[0].map(|p| p.side * p.node_state.surface).unwrap(),
-            },
+            surface,
             road_state,
             enviro,
             horosphere,
+            gravity_mirror,
         }
     }
 
-    pub fn up_direction(&self) -> MVector<f32> {
-        *self.surface.scaled_normal()
+    pub fn up_direction(&self, position: &Position) -> MVector<f32> {
+        if self.gravity_mirror.is_some() {
+            if
+            self.gravity_mirror.unwrap().mirror().distance_to(&MPoint::origin()).signum() != 
+            self.gravity_mirror.unwrap().mirror().distance_to(&(position.local * MPoint::origin())).signum() {
+                &MIsometry::reflection(&self.gravity_mirror.unwrap().mirror().scaled_normal().normalized_direction()) * self.surface.scaled_normal()
+            } else {
+                *self.surface.scaled_normal()
+            }
+        } else {
+            *self.surface.scaled_normal()
+        }
+    }
+
+    
+    pub fn gravity_mirror(&self) -> Option<GravityMirrorNode> {
+        self.gravity_mirror
+    }
+    pub fn surface(&self) -> Plane {
+        self.surface
     }
 }
 
@@ -217,6 +261,8 @@ pub struct ChunkParams {
     node_spice: u64,
     /// Horosphere to place in the chunk
     horosphere: Option<HorosphereChunk>,
+    /// Mirror
+    mirror: Option<Plane>,
 }
 
 impl ChunkParams {
@@ -239,6 +285,7 @@ impl ChunkParams {
                 .horosphere
                 .as_ref()
                 .map(|h| HorosphereChunk::new(h, chunk.vertex)),
+            mirror: state.gravity_mirror.as_ref().map(|h| *h.mirror())
         }
     }
 
@@ -315,7 +362,14 @@ impl ChunkParams {
             // is used to calculate elev_pre_noise which is used to calculate elev.
             let elev_pre_terracing = trilerp(&self.env.max_elevations, trilerp_coords);
             let block = trilerp(&self.env.blockinesses, trilerp_coords);
-            let voxel_elevation = self.surface.distance_to_chunk(self.chunk, &center);
+            let voxel_elevation = 
+            if self.mirror.is_some() &&
+            self.mirror.unwrap().distance_to(&MPoint::origin()).signum() != 
+            self.mirror.unwrap().distance_to_chunk(self.chunk, &center).signum() {
+                (&MIsometry::reflection(&self.mirror.unwrap().scaled_normal().normalized_direction()) * self.surface).distance_to_chunk(self.chunk, &center)
+            } else {
+                self.surface.distance_to_chunk(self.chunk, &center)
+            };
             let strength = 0.4 / (1.0 + math::sqr(voxel_elevation));
             let terracing_small = terracing_diff(elev_pre_terracing, block, 5.0, strength, 2.0);
             let terracing_big = terracing_diff(elev_pre_terracing, block, 15.0, strength, -1.0);
@@ -360,7 +414,14 @@ impl ChunkParams {
             let coords = na::Vector3::new(x, y, z);
             let center = voxel_center(self.dimension, coords);
             let horizontal_distance = plane.distance_to_chunk(self.chunk, &center);
-            let elevation = self.surface.distance_to_chunk(self.chunk, &center);
+            let elevation = 
+            if self.mirror.is_some() &&
+            self.mirror.unwrap().distance_to(&MPoint::origin()).signum() != 
+            self.mirror.unwrap().distance_to_chunk(self.chunk, &center).signum() {
+                (&MIsometry::reflection(&self.mirror.unwrap().scaled_normal().normalized_direction()) * self.surface).distance_to_chunk(self.chunk, &center)
+            } else {
+                self.surface.distance_to_chunk(self.chunk, &center)
+            };
 
             if horizontal_distance > 0.3 || elevation > 0.9 {
                 continue;

@@ -108,6 +108,30 @@ impl Plane {
         }
         self
     }
+
+    
+    /// Whether two planes intersect.
+    pub fn intersects(&self, plane: &Plane) -> bool {
+        if self.exponent == 0.0 && plane.exponent == 0.0{
+            return self.scaled_normal.mip(plane.scaled_normal()).abs() <= 1.0;
+        } else {
+            let mip_2 = self.scaled_normal.mip(plane.scaled_normal()).abs();
+            return libm::logf(mip_2) + self.exponent + plane.exponent <= 0.0;
+        }
+    }
+
+    
+    /// Weighted average of two planes
+    pub fn average(&self, plane: &Plane, other_weight: f32) -> Self {
+        if (self.exponent - plane.exponent).abs() < 0.01 {
+            return Self::from((plane.scaled_normal() * (1.0 - other_weight) + self.scaled_normal() * other_weight).normalized_direction());
+        } else if self.exponent > plane.exponent {
+            return self.clone();
+        } else {
+            return plane.clone();
+        }
+    }
+
 }
 
 #[cfg(test)]

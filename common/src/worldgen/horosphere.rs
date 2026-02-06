@@ -17,7 +17,7 @@ use crate::{
 /// Whether an assortment of random horospheres should be added to world generation. This is a temporary
 /// option until large structures that fit with the theme of the world are introduced.
 /// For code simplicity, this is made into a constant instead of a configuration option.
-const HOROSPHERES_ENABLED: bool = true;
+const HOROSPHERES_ENABLED: bool = false;
 
 /// Value to mix into the node's spice for generating horospheres. Chosen randomly.
 const HOROSPHERE_SEED: u64 = 6046133366614030452;
@@ -346,7 +346,7 @@ impl std::ops::Mul<Horosphere> for &MIsometry<f32> {
 
 /// Represents a region of space bounded by planes corresponding to a subset of a node's sides in that node's perspective.
 #[derive(Clone, Copy)]
-struct NodeBoundedRegion {
+pub struct NodeBoundedRegion {
     /// A bit-array with 12 elements, one for each side. A 1 means that that side is a bound, and a 0 means it is not.
     bounded_sides: u16,
 }
@@ -354,12 +354,12 @@ struct NodeBoundedRegion {
 impl NodeBoundedRegion {
     /// Creates a region with no bounds
     #[cfg(test)]
-    fn unbounded() -> Self {
+    pub fn unbounded() -> Self {
         NodeBoundedRegion { bounded_sides: 0 }
     }
 
     /// Creates a region that contains the given node and all its descendents
-    fn node_and_descendents(graph: &Graph, node_id: NodeId) -> Self {
+    pub fn node_and_descendents(graph: &Graph, node_id: NodeId) -> Self {
         let mut bounded_sides = 0;
         for (parent_side, _) in graph.parents(node_id) {
             bounded_sides |= 1 << (parent_side as u8);
@@ -368,7 +368,7 @@ impl NodeBoundedRegion {
     }
 
     /// Produces the set intersection of the `self` and `other` regions
-    fn intersect(self, other: NodeBoundedRegion) -> NodeBoundedRegion {
+    pub fn intersect(self, other: NodeBoundedRegion) -> NodeBoundedRegion {
         NodeBoundedRegion {
             bounded_sides: self.bounded_sides | other.bounded_sides,
         }
@@ -378,7 +378,7 @@ impl NodeBoundedRegion {
     /// the given side (in the perspective of the corresponding neighboring node).
     /// As a precondition, the given side cannot be an existing bound, as that would
     /// make the sub-region empty (which is non-representable in `NodeBoundedRegion`).
-    fn neighbor(self, neighbor_side: Side) -> NodeBoundedRegion {
+    pub fn neighbor(self, neighbor_side: Side) -> NodeBoundedRegion {
         debug_assert!(!self.is_bounded_by(neighbor_side));
 
         let mut bounded_sides = self.bounded_sides;
@@ -400,7 +400,7 @@ impl NodeBoundedRegion {
     /// Returns whether the node reachable via the given path is within the region.
     /// Note that this path is required to be one of the shortest paths that can reach
     /// that node.
-    fn contains_node(self, path: impl Iterator<Item = Side>) -> bool {
+    pub fn contains_node(self, path: impl Iterator<Item = Side>) -> bool {
         let mut current_region = self;
         for side in path {
             if current_region.is_bounded_by(side) {
@@ -412,12 +412,12 @@ impl NodeBoundedRegion {
     }
 
     /// Returns whether the given side bounds the region
-    fn is_bounded_by(self, side: Side) -> bool {
+    pub fn is_bounded_by(self, side: Side) -> bool {
         self.bounded_sides & (1 << (side as u8)) != 0
     }
 
     /// Adds the given side as a bound for the region
-    fn add_bound(&mut self, side: Side) {
+    pub fn add_bound(&mut self, side: Side) {
         self.bounded_sides |= 1 << (side as u8);
     }
 }
